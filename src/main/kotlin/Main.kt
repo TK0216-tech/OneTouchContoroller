@@ -1,3 +1,35 @@
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Notification
+import androidx.compose.ui.window.Tray
+import androidx.compose.ui.window.Window
+import androidx.compose.ui.window.application
+import androidx.compose.ui.window.isTraySupported
+import androidx.compose.ui.window.rememberTrayState
+import androidx.compose.ui.window.rememberWindowState
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
@@ -5,17 +37,20 @@ import io.ktor.server.netty.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import java.awt.BorderLayout
-import java.awt.Color
-import java.awt.FlowLayout
-import java.awt.Font
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.awt.MouseInfo
 import java.awt.Rectangle
 import java.awt.Robot
 import java.awt.Toolkit
+import java.awt.datatransfer.DataFlavor
+import java.awt.datatransfer.StringSelection
+import java.awt.event.KeyEvent
 import java.awt.event.InputEvent
-import java.awt.event.WindowAdapter
-import java.awt.event.WindowEvent
 import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -25,26 +60,14 @@ import java.net.NetworkInterface
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import javax.imageio.ImageIO
-import javax.swing.BorderFactory
-import javax.swing.BoxLayout
-import javax.swing.JButton
-import javax.swing.JFrame
-import javax.swing.JLabel
-import javax.swing.JOptionPane
-import javax.swing.JPanel
-import javax.swing.JScrollPane
-import javax.swing.JTextArea
-import javax.swing.JTextField
-import javax.swing.SwingUtilities
-import javax.swing.UIManager
 import kotlin.concurrent.thread
 
 // ================= SETTINGS =================
 const val PORT = 8080                  // HTTP port for commands (the app uses 8080)
 const val DISCOVERY_PORT = 8888        // UDP port for auto-discovery
 
-@Volatile var serverToken = "9999"          // can be changed in the window
-@Volatile var appLog: (String) -> Unit = { println(it) }  // the window replaces this with its log box
+@Volatile var serverToken = "change-me-123"               // can be changed in the window
+@Volatile var appLog: (String) -> Unit = { println(it) }  // the window replaces this with its log list
 
 // The token is saved in your user folder so you don't retype it every time
 val tokenFile = File(System.getProperty("user.home"), ".onetouch_token")
@@ -98,6 +121,111 @@ fun takeScreenshot(): String {
     val file = File(folder, "remote_screenshot_${System.currentTimeMillis()}.png")
     ImageIO.write(image, "png", file)
     return "Screenshot saved: ${file.name} (in Pictures)"
+}
+
+// ================= KEYBOARD =================
+// Names the phone is allowed to send, e.g. "enter", "ctrl+c", "alt+tab"
+val keyNames: Map<String, Int> = mapOf(
+    "enter" to KeyEvent.VK_ENTER, "backspace" to KeyEvent.VK_BACK_SPACE, "tab" to KeyEvent.VK_TAB,
+    "esc" to KeyEvent.VK_ESCAPE, "space" to KeyEvent.VK_SPACE, "delete" to KeyEvent.VK_DELETE,
+    "up" to KeyEvent.VK_UP, "down" to KeyEvent.VK_DOWN, "left" to KeyEvent.VK_LEFT, "right" to KeyEvent.VK_RIGHT,
+    "home" to KeyEvent.VK_HOME, "end" to KeyEvent.VK_END,
+    "pageup" to KeyEvent.VK_PAGE_UP, "pagedown" to KeyEvent.VK_PAGE_DOWN,
+    "ime" to KeyEvent.VK_KANJI,   // 半角/全角 key: switches the Japanese IME on/off
+    "ctrl" to KeyEvent.VK_CONTROL, "alt" to KeyEvent.VK_ALT, "shift" to KeyEvent.VK_SHIFT, "win" to KeyEvent.VK_WINDOWS
+)
+
+// Turns one key name into a Java key code (a-z, 0-9, f1-f12 and the names above). null = not allowed.
+fun keyCodeFor(name: String): Int? {
+    keyNames[name]?.let { return it }
+    if (name.length == 1 && name[0] in 'a'..'z') return KeyEvent.VK_A + (name[0] - 'a')
+    if (name.length == 1 && name[0] in '0'..'9') return KeyEvent.VK_0 + (name[0] - '0')
+    Regex("f([1-9]|1[0-2])").matchEntire(name)?.let { return KeyEvent.VK_F1 + it.groupValues[1].toInt() - 1 }
+    return null
+}
+
+// Holds all the keys down together, then lets go in reverse order (that's how Ctrl+C works)
+fun pressCombo(codes: List<Int>) {
+    codes.forEach { robot.keyPress(it); robot.delay(15) }
+    codes.reversed().forEach { robot.keyRelease(it); robot.delay(15) }
+}
+
+// Only one typing job at a time, because pasting borrows the clipboard and keystrokes must stay in order
+val typingLock = Mutex()
+
+// Puts text on the clipboard and presses Ctrl+V (blocking; callers hold typingLock).
+// The previous clipboard text is put back afterwards (images/files on the clipboard are not restored).
+fun pasteText(text: String) {
+    val clipboard = Toolkit.getDefaultToolkit().systemClipboard
+    val previous: String? = try {
+        if (clipboard.isDataFlavorAvailable(DataFlavor.stringFlavor))
+            clipboard.getData(DataFlavor.stringFlavor) as? String else null
+    } catch (e: Exception) { null }
+
+    clipboard.setContents(StringSelection(text), null)
+    robot.delay(80)
+    pressCombo(listOf(KeyEvent.VK_CONTROL, KeyEvent.VK_V))
+    robot.delay(250)   // give the other program time to read the clipboard
+
+    if (previous != null) {
+        try { clipboard.setContents(StringSelection(previous), null) } catch (e: Exception) { }
+    }
+}
+
+// Types any text (Japanese, emoji, symbols...) by pasting it.
+// Robot can't type most non-English characters directly, but pasting always works.
+suspend fun typeText(text: String) = typingLock.withLock {
+    withContext(Dispatchers.IO) { pasteText(text) }
+}
+
+// ---- Live typing (English): real key presses, so it feels like a normal keyboard ----
+// Letters, digits, space, Enter and Tab are pressed as keys. Everything else (punctuation, symbols,
+// non-English) is pasted, because Robot's symbol keys depend on the PC's keyboard layout (US vs JIS).
+fun liveKeyCode(c: Char): Int? = when (c) {
+    in 'a'..'z' -> KeyEvent.VK_A + (c - 'a')
+    in 'A'..'Z' -> KeyEvent.VK_A + (c - 'A')
+    in '0'..'9' -> KeyEvent.VK_0 + (c - '0')
+    ' ' -> KeyEvent.VK_SPACE
+    '\n' -> KeyEvent.VK_ENTER
+    '\t' -> KeyEvent.VK_TAB
+    else -> null
+}
+
+fun capsLockOn(): Boolean = try {
+    Toolkit.getDefaultToolkit().getLockingKeyState(KeyEvent.VK_CAPS_LOCK)
+} catch (e: Exception) { false }
+
+fun pressLiveKey(c: Char, caps: Boolean) {
+    val code = liveKeyCode(c) ?: return
+    // a capital letter needs Shift, unless Caps Lock is already on (then it is the other way round)
+    val shift = c.isLetter() && (c.isUpperCase() != caps)
+    if (shift) robot.keyPress(KeyEvent.VK_SHIFT)
+    robot.keyPress(code)
+    robot.keyRelease(code)
+    if (shift) robot.keyRelease(KeyEvent.VK_SHIFT)
+    robot.delay(4)
+}
+
+// Presses Backspace `backspaces` times, then types `text`
+suspend fun liveType(backspaces: Int, text: String) = typingLock.withLock {
+    withContext(Dispatchers.IO) {
+        repeat(backspaces) {
+            robot.keyPress(KeyEvent.VK_BACK_SPACE)
+            robot.keyRelease(KeyEvent.VK_BACK_SPACE)
+            robot.delay(4)
+        }
+        val caps = capsLockOn()
+        val pending = StringBuilder()   // characters that have to be pasted
+        for (c in text) {
+            if (liveKeyCode(c) != null) {
+                if (pending.isNotEmpty()) { pasteText(pending.toString()); pending.clear() }
+                pressLiveKey(c, caps)
+            } else {
+                pending.append(c)
+            }
+        }
+        if (pending.isNotEmpty()) pasteText(pending.toString())
+    }
 }
 
 // Returns true if the phone sent the right token; otherwise answers 401
@@ -162,6 +290,13 @@ fun Application.remoteModule() {
             call.respondText("PC Remote server is running")
         }
 
+        // ---- Web version of the remote (iPhone Safari, any browser): http://<PC IP>:8080/app ----
+        // The page itself is public; every action still needs the access token.
+        get("/app") {
+            call.response.headers.append("Cache-Control", "no-cache")
+            call.respondText(WEB_APP_HTML, ContentType.Text.Html)
+        }
+
         // ---- Run a whitelisted command ----
         post("/run") {
             if (!call.checkToken()) return@post
@@ -211,13 +346,73 @@ fun Application.remoteModule() {
             robot.mouseWheel(amount)
             call.respondText("OK")
         }
+
+        // ---- Keyboard: type a piece of text (plain UTF-8 text in the request body) ----
+        post("/keyboard/type") {
+            if (!call.checkToken()) return@post
+            val text = call.receiveText()
+            if (text.isEmpty() || text.length > 5000) {
+                call.respond(HttpStatusCode.BadRequest)
+                return@post
+            }
+            try {
+                typeText(text)
+            } catch (e: Exception) {
+                appLog("Typing failed: ${e.message}")
+                call.respondText("Failed: ${e.message}", status = HttpStatusCode.InternalServerError)
+                return@post
+            }
+            appLog("Typed ${text.length} characters")   // the text itself is not logged (could be a password)
+            call.respondText("Typed ${text.length} characters")
+        }
+
+        // ---- Keyboard: live typing. Body = "<number of backspaces>\n<text to type>" ----
+        post("/keyboard/live") {
+            if (!call.checkToken()) return@post
+            val body = call.receiveText()
+            val nl = body.indexOf('\n')
+            val backspaces = if (nl > 0) body.substring(0, nl).trim().toIntOrNull() else null
+            val text = if (nl >= 0) body.substring(nl + 1) else ""
+            if (backspaces == null || backspaces !in 0..500 || text.length > 500) {
+                call.respond(HttpStatusCode.BadRequest)
+                return@post
+            }
+            try {
+                liveType(backspaces, text)   // not logged: it happens on every key press and could be a password
+            } catch (e: Exception) {
+                call.respondText("Failed: ${e.message}", status = HttpStatusCode.InternalServerError)
+                return@post
+            }
+            call.respondText("OK")
+        }
+
+        // ---- Keyboard: press a key or shortcut, e.g. {"key":"enter"} or {"key":"ctrl+c"} ----
+        post("/keyboard/key") {
+            if (!call.checkToken()) return@post
+            val combo = jsonField(call.receiveText(), "key")?.lowercase()
+            val codes = combo?.split("+")?.map { keyCodeFor(it) }
+            if (combo == null || codes == null || codes.any { it == null }) {
+                appLog("Rejected unknown key: $combo")
+                call.respond(HttpStatusCode.NotFound)
+                return@post
+            }
+            try {
+                withContext(Dispatchers.IO) { pressCombo(codes.filterNotNull()) }
+            } catch (e: Exception) {
+                appLog("Key failed: ${e.message}")
+                call.respondText("Failed: ${e.message}", status = HttpStatusCode.InternalServerError)
+                return@post
+            }
+            appLog("Key: $combo")
+            call.respondText("OK")
+        }
     }
 }
 
 // ================= SERVER ON/OFF CONTROL =================
 // Starts and stops the HTTP server and the auto-discovery listener together.
 class ServerController {
-    var running = false
+    var running by mutableStateOf(false)   // Compose watches this, so the window and the tray update by themselves
         private set
     private var stopServer: (() -> Unit)? = null
     private var discoverySocket: DatagramSocket? = null
@@ -279,148 +474,331 @@ class ServerController {
     }
 }
 
-// ================= THE WINDOW (GUI) =================
-class ServerWindow : JFrame("One Touch Controller - PC Server") {
-    private val controller = ServerController()
+// ================= THE WINDOW (JETPACK COMPOSE) =================
 
-    private val statusLabel = JLabel()
-    private val toggleButton = JButton("Start server")
-    private val addressLabel = JLabel()
-    private val tokenField = JTextField(16)
-    private val applyButton = JButton("Apply token")
-    private val logArea = JTextArea()
+// The activity log shown in the window. Compose redraws the list automatically when it changes.
+val logLines = mutableStateListOf<String>()
 
-    init {
-        loadToken()
-        tokenField.text = serverToken
-        appLog = { message -> appendLog(message) }
+fun addLog(message: String) {
+    val time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
+    synchronized(logLines) {
+        logLines.add("[$time] $message")
+        if (logLines.size > 500) logLines.removeAt(0)   // keep the list from growing forever
+    }
+}
 
-        // ----- top part: status, addresses, token -----
-        val top = JPanel().apply {
-            layout = BoxLayout(this, BoxLayout.Y_AXIS)
-            border = BorderFactory.createEmptyBorder(8, 8, 4, 8)
-        }
-        statusLabel.font = statusLabel.font.deriveFont(Font.BOLD, 15f)
-        top.add(row(statusLabel, toggleButton))
-        top.add(row(JLabel("Type this IP in the phone app (or tap Find PC):")))
-        top.add(row(addressLabel))
-        top.add(row(JLabel("Access token:"), tokenField, applyButton))
-
-        // ----- middle part: log -----
-        logArea.isEditable = false
-        logArea.font = Font(Font.MONOSPACED, Font.PLAIN, 12)
-        val logPanel = JPanel(BorderLayout()).apply {
-            border = BorderFactory.createEmptyBorder(0, 8, 0, 8)
-            add(JLabel("Activity log:"), BorderLayout.NORTH)
-            add(JScrollPane(logArea), BorderLayout.CENTER)
-        }
-
-        // ----- bottom part -----
-        val clearButton = JButton("Clear log")
-        clearButton.addActionListener { logArea.text = "" }
-        val bottom = JPanel(FlowLayout(FlowLayout.RIGHT)).apply { add(clearButton) }
-
-        add(top, BorderLayout.NORTH)
-        add(logPanel, BorderLayout.CENTER)
-        add(bottom, BorderLayout.SOUTH)
-
-        // ----- button actions -----
-        toggleButton.addActionListener { toggleServer() }
-        applyButton.addActionListener {
-            val newToken = tokenField.text.trim()
-            if (newToken.isEmpty()) {
-                JOptionPane.showMessageDialog(this, "The token cannot be empty.")
-                return@addActionListener
+// Draws a QR code for `text` (used so a phone can open the web version by scanning)
+@Composable
+fun QrCode(text: String, modifier: Modifier = Modifier) {
+    val matrix = remember(text) {
+        QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, 0, 0, mapOf(EncodeHintType.MARGIN to 1))
+    }
+    Canvas(modifier) {
+        val cell = size.width / matrix.width
+        drawRect(Color.White)
+        for (y in 0 until matrix.height) {
+            for (x in 0 until matrix.width) {
+                if (matrix.get(x, y)) {
+                    drawRect(Color.Black, topLeft = Offset(x * cell, y * cell), size = Size(cell + 0.5f, cell + 0.5f))
+                }
             }
-            serverToken = newToken
-            saveToken()
-            appLog("Token updated")
         }
+    }
+}
 
-        // Stop the server properly when the window is closed
-        defaultCloseOperation = JFrame.EXIT_ON_CLOSE
-        addWindowListener(object : WindowAdapter() {
-            override fun windowClosing(e: WindowEvent?) {
-                controller.stop()
-            }
-        })
+@Composable
+fun ServerApp(controller: ServerController) {
+    val scope = rememberCoroutineScope()
 
-        // Refresh the address list every 5 seconds (it changes when you switch Wi-Fi or turn on the hotspot)
-        javax.swing.Timer(5000) { refreshAddresses() }.start()
+    // ----- state: when one of these changes, the screen updates by itself -----
+    val running = controller.running
+    var busy by remember { mutableStateOf(false) }
+    var addresses by remember { mutableStateOf(localAddresses()) }
+    var tokenText by remember { mutableStateOf(serverToken) }
+    var qrIndex by remember { mutableStateOf(-1) }   // which address the QR code uses (-1 = automatic)
+    var dialogMessage by remember { mutableStateOf<String?>(null) }
 
-        refreshAddresses()
-        updateState()
-        setSize(580, 460)
-        setLocationRelativeTo(null)
+    val lines = logLines.toList()
+    val listState = rememberLazyListState()
+
+    // Refresh the address list every 5 seconds (it changes when you switch Wi-Fi or turn on the hotspot)
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(5000)
+            addresses = withContext(Dispatchers.IO) { localAddresses() }
+        }
     }
 
-    // A small helper that puts components on one line
-    private fun row(vararg parts: java.awt.Component): JPanel =
-        JPanel(FlowLayout(FlowLayout.LEFT, 8, 4)).apply {
-            alignmentX = java.awt.Component.LEFT_ALIGNMENT
-            parts.forEach { add(it) }
+    // Scroll the log to the newest line
+    LaunchedEffect(lines.size) {
+        if (lines.isNotEmpty()) listState.animateScrollToItem(lines.size - 1)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text(
+            "One Touch Controller",
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.Bold
+        )
+
+        // ----- status + start/stop button -----
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(14.dp)
+                    .background(if (running) Color(0xFF2E9E4F) else Color.Gray, CircleShape)
+            )
+            Text(
+                if (running) "Running (port $PORT)" else "Stopped",
+                style = MaterialTheme.typography.titleMedium
+            )
+            Spacer(Modifier.weight(1f))
+            Button(
+                enabled = !busy,
+                onClick = {
+                    scope.launch {
+                        busy = true
+                        // start/stop run in the background so the window never freezes
+                        val error = toggleServer(controller)
+                        if (error != null) {
+                            appLog("Start failed: $error")
+                            dialogMessage = "Could not start the server:\n$error\n\n" +
+                                    "Is another copy of the server already running on port $PORT?"
+                        }
+                        addresses = localAddresses()
+                        busy = false
+                    }
+                }
+            ) {
+                Text(if (running) "Stop server" else "Start server")
+            }
         }
 
-    private fun toggleServer() {
-        if (controller.running) {
-            controller.stop()
-        } else {
-            try {
-                controller.start()
-            } catch (e: Exception) {
-                JOptionPane.showMessageDialog(
-                    this,
-                    "Could not start the server:\n${e.message}\n\nIs another copy of the server already running on port $PORT?",
-                    "Error",
-                    JOptionPane.ERROR_MESSAGE
+        // ----- PC address -----
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                "Type this IP in the phone app (or tap Find PC):",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            if (addresses.isEmpty()) {
+                Text(
+                    "No network found. Connect to Wi-Fi or turn on the Mobile hotspot.",
+                    color = MaterialTheme.colorScheme.error
                 )
-                appLog("Start failed: ${e.message}")
+            } else {
+                addresses.forEach { address ->
+                    Text(address, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                }
             }
         }
-        refreshAddresses()
-        updateState()
-    }
 
-    private fun updateState() {
-        if (controller.running) {
-            statusLabel.text = "●  Running (port $PORT)"
-            statusLabel.foreground = Color(0, 150, 0)
-            toggleButton.text = "Stop server"
-        } else {
-            statusLabel.text = "●  Stopped"
-            statusLabel.foreground = Color.GRAY
-            toggleButton.text = "Start server"
+        // ----- web version (iPhone / any browser) -----
+        val ips = addresses.map { it.substringBefore(" ") }   // just the IP, without the adapter name
+        if (ips.isNotEmpty()) {
+            // automatic choice: the Windows Mobile Hotspot address (192.168.137.x) if there is one, else the first
+            val autoIndex = ips.indexOfFirst { it.startsWith("192.168.137.") }.let { if (it >= 0) it else 0 }
+            val chosen = if (qrIndex in ips.indices) qrIndex else autoIndex
+            val webUrl = "http://${ips[chosen]}:$PORT/app"
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                QrCode(webUrl, Modifier.size(110.dp))
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("iPhone / any browser: scan the code or open", style = MaterialTheme.typography.bodyMedium)
+                    Text(webUrl, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                    Text(
+                        "In Safari: Share > Add to Home Screen. You still need the access token below.",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                    if (ips.size > 1) {
+                        TextButton(onClick = { qrIndex = (chosen + 1) % ips.size }) {
+                            Text("Wrong address? Use the next one (${chosen + 1}/${ips.size})")
+                        }
+                    }
+                }
+            }
+        }
+
+        // ----- token -----
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            OutlinedTextField(
+                value = tokenText,
+                onValueChange = { tokenText = it },
+                label = { Text("Access token") },
+                singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            Button(onClick = {
+                val newToken = tokenText.trim()
+                if (newToken.isEmpty()) {
+                    dialogMessage = "The token cannot be empty."
+                } else {
+                    serverToken = newToken
+                    saveToken()
+                    appLog("Token updated")
+                }
+            }) {
+                Text("Apply token")
+            }
+        }
+
+        // ----- activity log -----
+        Text("Activity log", style = MaterialTheme.typography.titleSmall)
+        Surface(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            shape = RoundedCornerShape(8.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant
+        ) {
+            LazyColumn(
+                state = listState,
+                contentPadding = PaddingValues(8.dp)
+            ) {
+                items(lines.size) { index ->
+                    Text(
+                        lines[index],
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp
+                    )
+                }
+            }
+        }
+
+        OutlinedButton(
+            onClick = { synchronized(logLines) { logLines.clear() } },
+            modifier = Modifier.align(Alignment.End)
+        ) {
+            Text("Clear log")
         }
     }
 
-    private fun refreshAddresses() {
-        val list = localAddresses()
-        addressLabel.text = if (list.isEmpty()) {
-            "No network found. Connect to Wi-Fi or turn on the Mobile hotspot."
-        } else {
-            "<html>" + list.joinToString("<br>") + "</html>"
-        }
+    // ----- message pop-up (errors) -----
+    dialogMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = { dialogMessage = null },
+            title = { Text("Notice") },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = { dialogMessage = null }) { Text("OK") }
+            }
+        )
     }
+}
 
-    // Can be called from any thread (for example from the server threads)
-    private fun appendLog(message: String) {
-        val time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
-        SwingUtilities.invokeLater {
-            logArea.append("[$time] $message\n")
-            logArea.caretPosition = logArea.document.length
-        }
+// ================= ICON (drawn with code, used for the window and the tray) =================
+val appIcon: Painter = object : Painter() {
+    override val intrinsicSize: Size = Size(256f, 256f)
+
+    override fun DrawScope.onDraw() {
+        drawRoundRect(Color(0xFF1E3A8A), cornerRadius = CornerRadius(size.minDimension / 5f))
+        drawCircle(Color.White, radius = size.minDimension / 4f, style = Stroke(width = size.minDimension / 14f))
+        drawCircle(Color.White, radius = size.minDimension / 12f)
+    }
+}
+
+// Starts the server if it is stopped, stops it if it is running.
+// Returns an error message, or null if everything went fine. Runs in the background.
+suspend fun toggleServer(controller: ServerController): String? = withContext(Dispatchers.IO) {
+    try {
+        if (controller.running) controller.stop() else controller.start()
+        null
+    } catch (e: Exception) {
+        e.message ?: "Unknown error"
     }
 }
 
 // ================= START THE PROGRAM =================
 fun main() {
     System.setProperty("java.awt.headless", "false") // needed so Robot and the window work
+    loadToken()
+    appLog = { message -> addLog(message) }
+    val controller = ServerController()
+
+    // The server starts automatically. You can still stop it with the button or the tray menu.
     try {
-        UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()) // Windows-style look
+        controller.start()
     } catch (e: Exception) {
-        // keep the default look
+        appLog("Could not start automatically: ${e.message}")
     }
-    SwingUtilities.invokeLater {
-        ServerWindow().isVisible = true
+
+    application {
+        val scope = rememberCoroutineScope()
+        val trayState = rememberTrayState()
+        var windowVisible by remember { mutableStateOf(true) }
+        var hintShown by remember { mutableStateOf(false) }
+
+        fun exitProgram() {
+            controller.stop()      // stop the server properly, then close
+            exitApplication()
+        }
+
+        // ----- system tray icon (next to the clock) -----
+        if (isTraySupported) {
+            Tray(
+                icon = appIcon,
+                state = trayState,
+                tooltip = if (controller.running) "One Touch Controller - running" else "One Touch Controller - stopped",
+                onAction = { windowVisible = true },   // click on the icon = open the window
+                menu = {
+                    Item("Open window", onClick = { windowVisible = true })
+                    Item(
+                        if (controller.running) "Stop server" else "Start server",
+                        onClick = {
+                            scope.launch {
+                                val error = toggleServer(controller)
+                                if (error != null) appLog("Start failed: $error")
+                            }
+                        }
+                    )
+                    Separator()
+                    Item("Exit", onClick = { exitProgram() })
+                }
+            )
+        }
+
+        // ----- the window -----
+        Window(
+            onCloseRequest = {
+                if (isTraySupported) {
+                    windowVisible = false      // closing the window only hides it; the server keeps running
+                    if (!hintShown) {
+                        hintShown = true
+                        trayState.sendNotification(
+                            Notification(
+                                "One Touch Controller",
+                                "Still running in the system tray. Right-click the icon to exit."
+                            )
+                        )
+                    }
+                } else {
+                    exitProgram()
+                }
+            },
+            visible = windowVisible,
+            title = "One Touch Controller - PC Server",
+            icon = appIcon,
+            state = rememberWindowState(width = 640.dp, height = 780.dp)
+        ) {
+            MaterialTheme {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    ServerApp(controller)
+                }
+            }
+        }
     }
 }
