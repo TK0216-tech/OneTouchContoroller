@@ -139,6 +139,8 @@ val WEB_APP_HTML = """<!DOCTYPE html>
   function describe(r, okText) {
     if (r.code === 200) return r.text || okText;
     if (r.code === 401) return 'Wrong token';
+    if (r.code === 403) return r.text || 'Blocked by the PC';
+    if (r.code === 429) return r.text || 'Too many wrong tokens. Wait a few minutes.';
     if (r.code === 404) return 'Unknown command or key';
     if (r.code === -1) return "Can't reach the PC. Is the server running and the phone on the same network?";
     return 'Server error (' + r.code + '): ' + r.text;
@@ -207,16 +209,17 @@ val WEB_APP_HTML = """<!DOCTYPE html>
   var pad = by('pad');
   var lastX = 0, lastY = 0, startX = 0, startY = 0, startT = 0;
   var moved = false, longFired = false, longTimer = null;
-  var pendX = 0, pendY = 0, lastSent = 0;
+  var pendX = 0, pendY = 0, lastSent = 0, moveBusy = false;
 
   // sends the collected movement (at most every 30 ms so the network is not flooded)
   function flush(force) {
     var now = Date.now();
-    if (!force && now - lastSent < 30) return;
+    if (!force && (now - lastSent < 30 || moveBusy)) return;
     var dx = Math.round(pendX), dy = Math.round(pendY);
     if (dx === 0 && dy === 0) return;
     pendX -= dx; pendY -= dy; lastSent = now;
-    api('/mouse/move', JSON.stringify({ dx: dx, dy: dy }));
+    moveBusy = true;   // wait for the PC to answer before sending the next movement (matters on slower connections)
+    api('/mouse/move', JSON.stringify({ dx: dx, dy: dy })).then(function () { moveBusy = false; });
   }
 
   pad.addEventListener('touchstart', function (e) {

@@ -230,8 +230,26 @@ suspend fun liveType(backspaces: Int, text: String) = typingLock.withLock {
 
 // Returns true if the phone sent the right token; otherwise answers 401
 suspend fun ApplicationCall.checkToken(): Boolean {
-    if (request.headers["X-Auth-Token"] == serverToken) return true
-    appLog("Rejected a request: wrong token")
+    val id = Guard.clientId(this)               // phone address (for internet visitors: the address Cloudflare reports)
+
+    val wait = Guard.blockedSeconds(id)
+    if (wait > 0) {                              // too many wrong tokens recently
+        respondText(
+            "Too many wrong tokens. Try again in $wait seconds.",
+            status = HttpStatusCode.TooManyRequests
+        )
+        return false
+    }
+
+    if (Guard.tokensEqual(request.headers["X-Auth-Token"], serverToken)) {
+        if (Guard.recordSuccess(id)) {
+            appLog("Device connected: $id" + if (Guard.isViaTunnel(this)) " (via the internet)" else "")
+        }
+        return true
+    }
+
+    val nowBlocked = Guard.recordFailure(id)
+    appLog("Rejected a request from $id: wrong token" + if (nowBlocked) " - blocked for 5 minutes" else "")
     respond(HttpStatusCode.Unauthorized)
     return false
 }
@@ -305,6 +323,14 @@ fun Application.remoteModule() {
             if (action == null) {
                 appLog("Rejected unknown command: $name")
                 call.respond(HttpStatusCode.NotFound)
+                return@post
+            }
+            if (name in Guard.dangerousOverInternet && Guard.isViaTunnel(call) && !Guard.allowDangerousOverInternet) {
+                appLog("Blocked over the internet: $name")
+                call.respondText(
+                    "Blocked: this command is switched off for internet access (see the PC window).",
+                    status = HttpStatusCode.Forbidden
+                )
                 return@post
             }
             appLog("Command: $name")
@@ -429,6 +455,7 @@ class ServerController {
 
     fun stop() {
         if (!running) return
+        tunnel.stop()          // no server = nothing for the internet tunnel to connect to
         stopDiscovery()
         try {
             stopServer?.invoke()
@@ -516,6 +543,9 @@ fun ServerApp(controller: ServerController) {
     var addresses by remember { mutableStateOf(localAddresses()) }
     var tokenText by remember { mutableStateOf(serverToken) }
     var qrIndex by remember { mutableStateOf(-1) }   // which address the QR code uses (-1 = automatic)
+    var tunnelBusy by remember { mutableStateOf(false) }            // true while the tunnel is being started/downloaded
+    var askDownload by remember { mutableStateOf(false) }           // show the "download cloudflared?" question
+    var allowDanger by remember { mutableStateOf(Guard.allowDangerousOverInternet) }
     var dialogMessage by remember { mutableStateOf<String?>(null) }
 
     val lines = logLines.toList()
@@ -538,7 +568,7 @@ fun ServerApp(controller: ServerController) {
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Text(
             "One Touch Controller",
@@ -642,10 +672,16 @@ fun ServerApp(controller: ServerController) {
                 singleLine = true,
                 modifier = Modifier.weight(1f)
             )
+            OutlinedButton(onClick = { tokenText = Guard.generateToken() }) {
+                Text("Generate")
+            }
             Button(onClick = {
                 val newToken = tokenText.trim()
                 if (newToken.isEmpty()) {
                     dialogMessage = "The token cannot be empty."
+                } else if (tunnel.active && newToken.length < MIN_REMOTE_TOKEN_LENGTH) {
+                    dialogMessage = "Internet access is on, so the token must have at least " +
+                            "$MIN_REMOTE_TOKEN_LENGTH characters. Turn internet access off first, or press Generate."
                 } else {
                     serverToken = newToken
                     saveToken()
@@ -653,6 +689,96 @@ fun ServerApp(controller: ServerController) {
                 }
             }) {
                 Text("Apply token")
+            }
+        }
+
+        // ----- internet access (Cloudflare tunnel) -----
+        Surface(
+            shape = RoundedCornerShape(8.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Internet access (Cloudflare tunnel)", style = MaterialTheme.typography.titleSmall)
+                        Text(tunnel.status, style = MaterialTheme.typography.bodyMedium)
+                    }
+                    Switch(
+                        checked = tunnel.active,
+                        enabled = !tunnelBusy && running,
+                        onCheckedChange = { wantOn ->
+                            if (!wantOn) {
+                                scope.launch(Dispatchers.IO) { tunnel.stop() }
+                            } else if (serverToken.length < MIN_REMOTE_TOKEN_LENGTH) {
+                                dialogMessage = "Internet access needs an access token of at least " +
+                                        "$MIN_REMOTE_TOKEN_LENGTH characters, because anyone on the internet could try to guess it.\n\n" +
+                                        "Press \"Generate\", then \"Apply token\", and enter the new token in your phone app / web page."
+                            } else {
+                                scope.launch {
+                                    tunnelBusy = true
+                                    try {
+                                        val exe = withContext(Dispatchers.IO) { tunnel.findCloudflared() }
+                                        if (exe == null) askDownload = true
+                                        else withContext(Dispatchers.IO) { tunnel.start(exe) }
+                                    } catch (e: Exception) {
+                                        dialogMessage = "Could not start the tunnel:\n${e.message}"
+                                    }
+                                    tunnelBusy = false
+                                }
+                            }
+                        }
+                    )
+                }
+
+                if (!running) {
+                    Text("Start the server first.", style = MaterialTheme.typography.labelMedium)
+                } else if (serverToken.length < MIN_REMOTE_TOKEN_LENGTH) {
+                    Text(
+                        "Needs an access token with at least $MIN_REMOTE_TOKEN_LENGTH characters (press Generate, then Apply token).",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+
+                val publicUrl = tunnel.url
+                if (publicUrl != null) {
+                    val appUrl = "$publicUrl/app"
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        QrCode(appUrl, Modifier.size(100.dp))
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text("Open on any phone, any network:", style = MaterialTheme.typography.bodyMedium)
+                            Text(appUrl, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text(
+                                "Android app: type " + publicUrl + " in the IP box. You still need the access token.",
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                            OutlinedButton(onClick = {
+                                Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(publicUrl), null)
+                            }) { Text("Copy address") }
+                        }
+                    }
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = allowDanger,
+                        onCheckedChange = {
+                            allowDanger = it
+                            Guard.allowDangerousOverInternet = it
+                            appLog(if (it) "Shutdown/restart/scripts are now ALLOWED over the internet"
+                            else "Shutdown/restart/scripts are blocked over the internet")
+                        }
+                    )
+                    Text("Allow shutdown, restart and scripts over the internet", style = MaterialTheme.typography.bodyMedium)
+                }
+                Text(
+                    "Anyone who has the address AND the token can control this PC. The address changes every time you turn this on.",
+                    style = MaterialTheme.typography.labelMedium
+                )
             }
         }
 
@@ -685,6 +811,36 @@ fun ServerApp(controller: ServerController) {
         ) {
             Text("Clear log")
         }
+    }
+
+    // ----- "download cloudflared?" question -----
+    if (askDownload) {
+        AlertDialog(
+            onDismissRequest = { askDownload = false },
+            title = { Text("Download cloudflared?") },
+            text = {
+                Text(
+                    "Internet access needs the free program \"cloudflared\" from Cloudflare (about 55 MB).\n\n" +
+                            "It will be downloaded from github.com/cloudflare/cloudflared and saved in your user folder (.onetouch). " +
+                            "Download it now?"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    askDownload = false
+                    scope.launch {
+                        tunnelBusy = true
+                        try {
+                            withContext(Dispatchers.IO) { tunnel.start(tunnel.download()) }
+                        } catch (e: Exception) {
+                            dialogMessage = "Download failed:\n${e.message}"
+                        }
+                        tunnelBusy = false
+                    }
+                }) { Text("Download") }
+            },
+            dismissButton = { TextButton(onClick = { askDownload = false }) { Text("Cancel") } }
+        )
     }
 
     // ----- message pop-up (errors) -----
@@ -743,6 +899,7 @@ fun main() {
         var hintShown by remember { mutableStateOf(false) }
 
         fun exitProgram() {
+            tunnel.stop()          // close the internet tunnel first
             controller.stop()      // stop the server properly, then close
             exitApplication()
         }
@@ -792,7 +949,7 @@ fun main() {
             visible = windowVisible,
             title = "One Touch Controller - PC Server",
             icon = appIcon,
-            state = rememberWindowState(width = 640.dp, height = 780.dp)
+            state = rememberWindowState(width = 640.dp, height = 840.dp)
         ) {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
