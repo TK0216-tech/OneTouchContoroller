@@ -50,6 +50,8 @@ val WEB_APP_HTML = """<!DOCTYPE html>
   .view { display: none; flex: 1; min-height: 0; overflow-y: auto; }
   .view.active { display: flex; flex-direction: column; gap: 10px; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stack { display: grid; grid-template-columns: 1fr; gap: 8px; }
+  .stack button { min-height: 62px; font-size: 17px; }
   .keys { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
   .keys button { min-height: 46px; font-size: 14px; padding: 0 2px; }
   #padwrap { display: flex; gap: 10px; flex: 1; min-height: 220px; }
@@ -79,6 +81,7 @@ val WEB_APP_HTML = """<!DOCTYPE html>
     <button data-tab="cmd" class="active">Commands</button>
     <button data-tab="pad">Touchpad</button>
     <button data-tab="kb">Keyboard</button>
+    <button data-tab="routines">Routines</button>
   </div>
 
   <!-- ===== Commands ===== -->
@@ -89,7 +92,7 @@ val WEB_APP_HTML = """<!DOCTYPE html>
   <!-- ===== Touchpad ===== -->
   <div id="view-pad" class="view">
     <div id="padwrap">
-      <div id="pad">Touchpad<br>tap = click, hold = right click</div>
+      <div id="pad"><div style="text-align:center">Touchpad<br>tap = click, hold = right click<br><br><span id="padInfo">Standard connection (slower)</span></div></div>
       <div id="scroll">Scroll</div>
     </div>
     <div class="btnrow">
@@ -110,6 +113,13 @@ val WEB_APP_HTML = """<!DOCTYPE html>
     </div>
     <div class="hint" id="kbHint">Click the place you want to type into on your PC first.</div>
     <div class="keys" id="keyGrid"></div>
+  </div>
+
+  <!-- ===== Routines ===== -->
+  <div id="view-routines" class="view">
+    <button id="reloadRoutines">Refresh list</button>
+    <div class="stack" id="routineList"></div>
+    <div class="hint" id="routineHint"></div>
   </div>
 
   <div id="status">Ready</div>
@@ -160,6 +170,8 @@ val WEB_APP_HTML = """<!DOCTYPE html>
   by('saveToken').onclick = function () {
     token = by('token').value.trim();
     try { localStorage.setItem('otc_token', token); } catch (e) {}
+    if (ws) { var old = ws; ws = null; wsReady = false; try { old.close(); } catch (e) {} }   // reconnect with the new token right away
+    wsRetryAt = 0; latency = -1; showLatency();
     by('token').blur();
     setStatus(token ? 'Token saved on this phone' : 'Token is empty');
   };
@@ -171,11 +183,48 @@ val WEB_APP_HTML = """<!DOCTYPE html>
     b.onclick = function () {
       Array.prototype.forEach.call(tabButtons, function (x) { x.classList.remove('active'); });
       b.classList.add('active');
-      ['cmd', 'pad', 'kb'].forEach(function (name) {
+      ['cmd', 'pad', 'kb', 'routines'].forEach(function (name) {
         by('view-' + name).classList.toggle('active', name === b.getAttribute('data-tab'));
       });
+      if (b.getAttribute('data-tab') === 'pad') wsConnect();
+      if (b.getAttribute('data-tab') === 'routines') loadRoutines();
     };
   });
+
+  // ---------- Routines ----------
+  // A routine is a list of steps (e.g. "get ready for Valorant") written in a file on the PC.
+  // This page only shows their names and tells the PC which one to run.
+  function loadRoutines() {
+    fetch('/routines', { headers: { 'X-Auth-Token': token }, cache: 'no-store' }).then(function (r) {
+      return r.text().then(function (t) { return { code: r.status, text: t }; });
+    }).catch(function () {
+      return { code: -1, text: '' };
+    }).then(function (r) {
+      var list = by('routineList');
+      list.innerHTML = '';
+      if (r.code !== 200) { setStatus(describe(r, '')); return; }
+      var lines = r.text.split('\n').filter(function (l) { return l.trim() !== ''; });
+      by('routineHint').textContent = lines.length ? '' :
+        'No routines yet. On the PC press "Edit file" in the One Touch Controller window, write a routine, press "Reload" there, then Refresh here.';
+      setStatus(lines.length ? lines.length + ' routine(s)' : 'No routines on the PC yet');
+      lines.forEach(function (line) {
+        var p = line.split('\t');
+        var name = p[1] || p[0];
+        var b = document.createElement('button');
+        b.textContent = name;
+        if (p[2] === '!') b.className = 'danger';
+        b.onclick = function () {
+          if (p[2] === '!' && !confirm('Run "' + name + '"? It contains shutdown, restart or script steps.')) return;
+          setStatus('Sending...');
+          api('/routine/run', JSON.stringify({ id: p[0] })).then(function (res) {
+            setStatus(describe(res, 'Started'));
+          });
+        };
+        list.appendChild(b);
+      });
+    });
+  }
+  by('reloadRoutines').onclick = loadRoutines;
 
   // ---------- Commands ----------
   var commands = [
@@ -201,8 +250,54 @@ val WEB_APP_HTML = """<!DOCTYPE html>
     by('cmdGrid').appendChild(b);
   });
 
+  // ---------- Fast live connection (WebSocket) ----------
+  // A normal request waits for the PC's answer after every movement. Over the internet that takes 100-300 ms,
+  // so only a few movements per second get through. A WebSocket stays open and the movements stream through
+  // without waiting. If it is not connected (yet), normal requests are used instead.
+  var ws = null, wsReady = false, wsRetryAt = 0, latency = -1;
+
+  function showLatency() {
+    by('padInfo').textContent = latency >= 0 ? 'Live connection: ' + latency + ' ms' : 'Standard connection (slower)';
+  }
+
+  function wsConnect() {
+    if (!token || (ws && ws.readyState < 2) || Date.now() < wsRetryAt) return;
+    var sock;
+    try {
+      sock = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+    } catch (e) { return; }
+    ws = sock; wsReady = false;
+    sock.onopen = function () { sock.send('auth ' + token); };
+    sock.onmessage = function (e) {
+      if (e.data === 'ok') {
+        if (ws === sock) wsReady = true;
+      } else if (typeof e.data === 'string' && e.data.indexOf('q ') === 0) {
+        latency = Math.max(0, Date.now() - Number(e.data.substring(2)));
+        showLatency();
+      }
+    };
+    sock.onclose = function (e) {
+      if (ws !== sock) return;
+      wsReady = false; latency = -1; showLatency();
+      wsRetryAt = Date.now() + (e.code === 1008 ? 10000 : 2000);   // 1008 = wrong token: do not hammer the server
+    };
+    sock.onerror = function () {};
+  }
+
+  function wsOk() { return wsReady && ws && ws.readyState === 1; }
+
+  // while the touchpad tab is open: keep it connected and measure the delay every 2 seconds
+  setInterval(function () {
+    if (!by('view-pad').classList.contains('active')) return;
+    wsConnect();
+    if (wsOk()) ws.send('p ' + Date.now());
+  }, 2000);
+
   // ---------- Touchpad ----------
-  function click(button) { api('/mouse/click', JSON.stringify({ button: button })); }
+  function click(button) {
+    if (wsOk()) { ws.send('c ' + button); return; }
+    api('/mouse/click', JSON.stringify({ button: button }));
+  }
   by('leftClick').onclick = function () { click('left'); };
   by('rightClick').onclick = function () { click('right'); };
 
@@ -211,14 +306,26 @@ val WEB_APP_HTML = """<!DOCTYPE html>
   var moved = false, longFired = false, longTimer = null;
   var pendX = 0, pendY = 0, lastSent = 0, moveBusy = false;
 
-  // sends the collected movement (at most every 30 ms so the network is not flooded)
+  // sends the collected movement
   function flush(force) {
     var now = Date.now();
+    var dx, dy;
+    if (wsOk()) {
+      // live connection: no waiting for answers. If the network is slow right now, keep collecting and send more later.
+      if (!force && now - lastSent < 16) return;
+      if (ws.bufferedAmount > 1024) return;
+      dx = Math.round(pendX); dy = Math.round(pendY);
+      if (dx === 0 && dy === 0) return;
+      pendX -= dx; pendY -= dy; lastSent = now;
+      ws.send('m ' + dx + ' ' + dy);
+      return;
+    }
+    // no live connection: normal requests, one at a time
     if (!force && (now - lastSent < 30 || moveBusy)) return;
-    var dx = Math.round(pendX), dy = Math.round(pendY);
+    dx = Math.round(pendX); dy = Math.round(pendY);
     if (dx === 0 && dy === 0) return;
     pendX -= dx; pendY -= dy; lastSent = now;
-    moveBusy = true;   // wait for the PC to answer before sending the next movement (matters on slower connections)
+    moveBusy = true;   // wait for the PC to answer before sending the next movement
     api('/mouse/move', JSON.stringify({ dx: dx, dy: dy })).then(function () { moveBusy = false; });
   }
 
@@ -228,6 +335,7 @@ val WEB_APP_HTML = """<!DOCTYPE html>
     lastX = startX = t.clientX; lastY = startY = t.clientY;
     startT = Date.now(); moved = false; longFired = false;
     pendX = 0; pendY = 0;
+    wsConnect();
     clearTimeout(longTimer);
     longTimer = setTimeout(function () {
       if (!moved) { longFired = true; click('right'); if (navigator.vibrate) navigator.vibrate(20); }
@@ -273,7 +381,8 @@ val WEB_APP_HTML = """<!DOCTYPE html>
     var notches = pendScroll < 0 ? Math.ceil(pendScroll) : Math.floor(pendScroll);
     if (notches !== 0) {
       pendScroll -= notches;
-      api('/mouse/scroll', JSON.stringify({ amount: notches }));
+      if (wsOk()) ws.send('s ' + notches);
+      else api('/mouse/scroll', JSON.stringify({ amount: notches }));
     }
   }, { passive: false });
 

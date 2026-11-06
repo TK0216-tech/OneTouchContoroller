@@ -37,12 +37,22 @@ import io.ktor.server.netty.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import io.ktor.server.websocket.WebSockets
+import io.ktor.server.websocket.webSocket
+import io.ktor.websocket.CloseReason
+import io.ktor.websocket.Frame
+import io.ktor.websocket.close
+import io.ktor.websocket.readText
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicInteger
 import java.awt.MouseInfo
 import java.awt.Rectangle
 import java.awt.Robot
@@ -301,8 +311,75 @@ val allowedCommands: Map<String, () -> String> = mapOf(
     "cancel_shutdown" to { startProcess("shutdown", "/a"); "Shutdown/restart cancelled" },
 )
 
+// ================= ROUTINES (automation) =================
+// The routines themselves live in ~/.onetouch/routines.txt (see Routines.kt). This is what their steps really do on the PC.
+val routineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+fun isValidKeyCombo(combo: String): Boolean = combo.split("+").all { keyCodeFor(it) != null }
+
+fun reloadRoutines() {
+    RoutineStore.load(allowedCommands.keys, ::isValidKeyCombo)
+    appLog("Routines loaded: ${RoutineStore.routines.size}" +
+            if (RoutineStore.problems.isEmpty()) "" else " (${RoutineStore.problems.size} problem(s) in the file)")
+}
+
+object RealRoutineActions : RoutineActions {
+    override fun launch(program: String, args: List<String>) {
+        val builder = ProcessBuilder(listOf(program) + args)
+        File(program).parentFile?.takeIf { it.isDirectory }?.let { builder.directory(it) }   // many programs expect their own folder
+        builder.start()
+    }
+
+    // rundll32 + FileProtocolHandler opens websites, files and folders the same way a double-click does
+    override fun open(target: String) {
+        ProcessBuilder("rundll32", "url.dll,FileProtocolHandler", target).start()
+    }
+
+    override fun key(combo: String) {
+        val codes = combo.split("+").map { keyCodeFor(it) }
+        if (codes.any { it == null }) throw IllegalArgumentException("unknown key \"$combo\"")
+        pressCombo(codes.filterNotNull())
+    }
+
+    override fun close(exe: String) {
+        ProcessBuilder("taskkill", "/IM", exe, "/F").redirectErrorStream(true).start().waitFor()
+    }
+
+    override fun power(plan: String) {
+        val guid = when (plan) {
+            "high" -> "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+            "saver" -> "a1841308-3541-4fab-bc81-f71556f20b4f"
+            else -> "381b4222-f694-41f0-9685-ff5bb260df2e"      // balanced
+        }
+        val process = ProcessBuilder("powercfg", "/setactive", guid).redirectErrorStream(true).start()
+        val output = process.inputStream.bufferedReader().readText().trim()
+        if (process.waitFor() != 0) throw RuntimeException("this PC has no \"$plan\" power plan (${output.take(80)})")
+    }
+
+    override fun command(id: String) {
+        val action = allowedCommands[id] ?: throw IllegalArgumentException("unknown command \"$id\"")
+        action()
+    }
+
+    override fun valorant() {
+        val riot = findRiotClient()
+            ?: throw RuntimeException("Riot Client not found. Use:  launch \"<path to RiotClientServices.exe>\" --launch-product=valorant --launch-patchline=live")
+        launch(riot, VALORANT_ARGS)
+    }
+
+    override fun log(message: String) = appLog(message)
+}
+
 // ================= SERVER ROUTES =================
+// How many live connections (WebSockets) are open at the moment, including ones that have not logged in yet
+val liveConnections = AtomicInteger(0)
+
 fun Application.remoteModule() {
+    install(WebSockets) {
+        pingPeriodMillis = 15_000     // keeps the connection alive through Cloudflare / routers
+        timeoutMillis = 30_000
+        maxFrameSize = 4096           // our messages are tiny; anything bigger is refused
+    }
     routing {
         get("/") {
             call.respondText("PC Remote server is running")
@@ -342,6 +419,100 @@ fun Application.remoteModule() {
                 return@post
             }
             call.respondText(message)
+        }
+
+        // ---- Fast live connection for the touchpad (see SocketProtocol.kt) ----
+        // Same token as everything else: the first message must be "auth <token>".
+        webSocket("/ws") {
+            if (liveConnections.incrementAndGet() > 20) {      // nobody needs more than a few
+                liveConnections.decrementAndGet()
+                close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "busy"))
+                return@webSocket
+            }
+            try {
+                val id = Guard.clientId(call)
+                val wait = Guard.blockedSeconds(id)
+                if (wait > 0) {
+                    send(Frame.Text("blocked $wait"))
+                    close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "blocked"))
+                    return@webSocket
+                }
+
+                // the login message has to arrive within 5 seconds
+                val first = withTimeoutOrNull(5000) { incoming.receiveCatching().getOrNull() }
+                val given = (first as? Frame.Text)?.readText()?.takeIf { it.startsWith("auth ") }?.substring(5)
+                if (!Guard.tokensEqual(given, serverToken)) {
+                    val nowBlocked = Guard.recordFailure(id)
+                    appLog("Rejected a live connection from $id: wrong token" + if (nowBlocked) " - blocked for 5 minutes" else "")
+                    send(Frame.Text("denied"))
+                    close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "denied"))
+                    return@webSocket
+                }
+                if (Guard.recordSuccess(id)) {
+                    appLog("Device connected: $id" + if (Guard.isViaTunnel(call)) " (via the internet)" else "")
+                }
+                send(Frame.Text("ok"))
+
+                for (frame in incoming) {
+                    if (frame !is Frame.Text) continue
+                    when (val command = parseSocketCommand(frame.readText())) {
+                        is SocketCommand.Move -> {
+                            val p = MouseInfo.getPointerInfo().location
+                            robot.mouseMove(p.x + command.dx, p.y + command.dy)
+                        }
+                        is SocketCommand.Click -> {
+                            val button = if (command.right) InputEvent.BUTTON3_DOWN_MASK else InputEvent.BUTTON1_DOWN_MASK
+                            robot.mousePress(button)
+                            robot.mouseRelease(button)
+                        }
+                        is SocketCommand.Scroll -> robot.mouseWheel(command.amount)
+                        is SocketCommand.Ping -> send(Frame.Text("q ${command.stamp}"))
+                        null -> { }   // unknown message: ignored
+                    }
+                }
+            } finally {
+                liveConnections.decrementAndGet()
+            }
+        }
+
+        // ---- Routines (automation): the phone only sends the NAME of a routine ----
+        get("/routines") {
+            if (!call.checkToken()) return@get
+            // one line per routine:  id <TAB> name <TAB> "!" if it contains shutdown/restart/script commands
+            val list = RoutineStore.routines.joinToString("\n") { r ->
+                r.id + "\t" + r.name + "\t" + (if (r.isDangerous(Guard.dangerousOverInternet)) "!" else "")
+            }
+            call.respondText(list)
+        }
+
+        post("/routine/run") {
+            if (!call.checkToken()) return@post
+            val routine = RoutineStore.find(jsonField(call.receiveText(), "id"))
+            if (routine == null) {
+                call.respond(HttpStatusCode.NotFound)
+                return@post
+            }
+            if (routine.isDangerous(Guard.dangerousOverInternet) && Guard.isViaTunnel(call) && !Guard.allowDangerousOverInternet) {
+                appLog("Blocked over the internet: routine ${routine.id}")
+                call.respondText(
+                    "Blocked: this routine has shutdown/restart/script steps, which are disabled over the internet.",
+                    status = HttpStatusCode.Forbidden
+                )
+                return@post
+            }
+            if (!RoutineStore.running.add(routine.id)) {
+                call.respondText("Already running: ${routine.name}")
+                return@post
+            }
+            appLog("Routine started: ${routine.name}")
+            routineScope.launch {                       // runs in the background, the phone does not have to wait
+                try {
+                    executeRoutine(routine, RealRoutineActions)
+                } finally {
+                    RoutineStore.running.remove(routine.id)
+                }
+            }
+            call.respondText("Started: ${routine.name}")
         }
 
         // ---- Touchpad: move the mouse by (dx, dy) pixels ----
@@ -782,6 +953,37 @@ fun ServerApp(controller: ServerController) {
             }
         }
 
+        // ----- automation routines -----
+        Surface(
+            shape = RoundedCornerShape(8.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Automation routines", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            if (RoutineStore.routines.isEmpty()) "None loaded" else RoutineStore.routines.joinToString(", ") { it.name },
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1
+                        )
+                    }
+                    OutlinedButton(onClick = {
+                        try {
+                            ProcessBuilder("notepad.exe", RoutineStore.file.absolutePath).start()
+                        } catch (e: Exception) {
+                            dialogMessage = "Could not open Notepad. The file is here:\n${RoutineStore.file.absolutePath}"
+                        }
+                    }) { Text("Edit file") }
+                    OutlinedButton(onClick = { reloadRoutines() }) { Text("Reload") }
+                }
+                RoutineStore.problems.take(3).forEach {
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+
         // ----- activity log -----
         Text("Activity log", style = MaterialTheme.typography.titleSmall)
         Surface(
@@ -882,6 +1084,7 @@ suspend fun toggleServer(controller: ServerController): String? = withContext(Di
 fun main() {
     System.setProperty("java.awt.headless", "false") // needed so Robot and the window work
     loadToken()
+    reloadRoutines()
     appLog = { message -> addLog(message) }
     val controller = ServerController()
 
@@ -949,7 +1152,7 @@ fun main() {
             visible = windowVisible,
             title = "One Touch Controller - PC Server",
             icon = appIcon,
-            state = rememberWindowState(width = 640.dp, height = 840.dp)
+            state = rememberWindowState(width = 640.dp, height = 900.dp)
         ) {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {

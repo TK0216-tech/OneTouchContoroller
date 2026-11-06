@@ -19,6 +19,7 @@ dependencies {
     // Ktor server (same as before)
     implementation("io.ktor:ktor-server-core-jvm:3.0.3")
     implementation("io.ktor:ktor-server-netty-jvm:3.0.3")
+    implementation("io.ktor:ktor-server-websockets-jvm:3.0.3")   // fast live connection for the touchpad
     implementation("org.slf4j:slf4j-simple:2.0.16")
     implementation("com.google.zxing:core:3.5.3")   // draws the QR code for the web version
 }
