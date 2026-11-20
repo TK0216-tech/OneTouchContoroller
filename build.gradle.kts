@@ -11,6 +11,10 @@ repositories {
     google()
 }
 
+kotlin {
+    jvmToolchain(17)
+}
+
 dependencies {
     // Jetpack Compose for Desktop (the window)
     implementation(compose.desktop.currentOs)
@@ -25,11 +29,21 @@ dependencies {
     implementation("com.github.kwhat:jnativehook:2.2.2")   // hears the mouse and keyboard while a routine is recorded
     implementation("net.java.dev.jna:jna:5.15.0")            // Guard mode: talks to Windows (block mouse and keyboard)
     implementation("net.java.dev.jna:jna-platform:5.15.0")
+
+    // Tests (never included in the packaged application)
+    testImplementation(kotlin("test"))
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+    testImplementation("io.ktor:ktor-server-test-host-jvm:3.0.3")
+    testImplementation("io.ktor:ktor-client-websockets-jvm:3.0.3")
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 compose.desktop {
     application {
-        mainClass = "MainKt"
+        mainClass = "jp.relative.tech.one_touch_controller.MainKt"
 
         nativeDistributions {
             // Exe = installer (needs WiX Toolset 3). The portable folder needs no extra tools.
