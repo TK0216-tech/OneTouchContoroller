@@ -1,5 +1,9 @@
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -13,10 +17,13 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -41,9 +48,13 @@ import io.ktor.server.websocket.WebSockets
 import io.ktor.server.websocket.webSocket
 import io.ktor.websocket.CloseReason
 import io.ktor.websocket.Frame
+import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
@@ -306,8 +317,9 @@ val allowedCommands: Map<String, () -> String> = mapOf(
     // System
     "lock_screen" to { startProcess("rundll32.exe", "user32.dll,LockWorkStation"); "PC locked" },
     "screenshot" to { takeScreenshot() },
-    "shutdown_60" to { startProcess("shutdown", "/s", "/t", "60"); "Shutting down in 60 seconds" },
-    "restart_60" to { startProcess("shutdown", "/r", "/t", "60"); "Restarting in 60 seconds" },
+    // (Guard mode refuses shutdowns, so it is turned off first when YOU ask for one from the phone)
+    "shutdown_60" to { GuardMode.turnOff("shutdown from the phone"); startProcess("shutdown", "/s", "/t", "60"); "Shutting down in 60 seconds" },
+    "restart_60" to { GuardMode.turnOff("restart from the phone"); startProcess("shutdown", "/r", "/t", "60"); "Restarting in 60 seconds" },
     "cancel_shutdown" to { startProcess("shutdown", "/a"); "Shutdown/restart cancelled" },
 )
 
@@ -315,12 +327,71 @@ val allowedCommands: Map<String, () -> String> = mapOf(
 // The routines themselves live in ~/.onetouch/routines.txt (see Routines.kt). This is what their steps really do on the PC.
 val routineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+// Ids of the routines that are running right now. The PC window watches this ("Running..." on the button).
+var runningRoutines by mutableStateOf(setOf<String>())
+
+// How the last run of each routine ended: id -> number of steps that failed (0 = everything worked).
+// The phone asks for this (GET /routine/status) to show "Finished".
+val routineResults = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+/**
+ * Starts a routine in the background. Used by the phone (/routine/run) and by the Run buttons in the PC window.
+ * Returns the message for the phone: "Started: ..." or "Already running: ...".
+ */
+fun startRoutine(routine: Routine, from: String): String {
+    if (!RoutineStore.running.add(routine.id)) return "Already running: ${routine.name}"
+    runningRoutines = runningRoutines + routine.id
+    appLog("Routine started ($from): ${routine.name}")
+    routineResults.remove(routine.id)
+    routineScope.launch {
+        var failed = 0
+        // the real actions, but failed steps are counted (executeRoutine reports them through log)
+        val counting = object : RoutineActions by RealRoutineActions {
+            override fun log(message: String) {
+                if (message.trimStart().startsWith("This step failed")) failed++
+                RealRoutineActions.log(message)
+            }
+        }
+        try {
+            executeRoutine(routine, counting)
+        } finally {
+            routineResults[routine.id] = failed           // first the result, then "not running" (no gap for the phone)
+            RoutineStore.running.remove(routine.id)
+            runningRoutines = runningRoutines - routine.id
+        }
+    }
+    return "Started: ${routine.name}"
+}
+
 fun isValidKeyCombo(combo: String): Boolean = combo.split("+").all { keyCodeFor(it) != null }
 
 fun reloadRoutines() {
     RoutineStore.load(allowedCommands.keys, ::isValidKeyCombo)
     appLog("Routines loaded: ${RoutineStore.routines.size}" +
             if (RoutineStore.problems.isEmpty()) "" else " (${RoutineStore.problems.size} problem(s) in the file)")
+}
+
+/**
+ * Deletes a routine from routines.txt (and its recording, if no other routine uses it).
+ * Returns an error message, or null when it worked.
+ */
+fun deleteRoutine(routine: Routine): String? {
+    if (routine.id in RoutineStore.running) return "\"${routine.name}\" is running. Wait until it has finished."
+    return try {
+        val text = RoutineStore.file.readText()
+        val newText = removeRoutineText(text, routine.id) ?: return "\"${routine.name}\" is not in the routines file any more. Press Reload."
+        RoutineStore.file.writeText(newText)
+        reloadRoutines()
+        // a recording that no other routine uses is deleted too
+        val stillUsed = RoutineStore.routines.flatMap { r -> r.steps.filterIsInstance<Step.Replay>().map { it.file } }.toSet()
+        routine.steps.filterIsInstance<Step.Replay>().map { it.file }.filter { it !in stillUsed }.forEach { name ->
+            File(InputRecorder.folder, name).delete()
+        }
+        appLog("Routine deleted: ${routine.name}")
+        null
+    } catch (e: Exception) {
+        "Could not change the routines file: ${e.message}"
+    }
 }
 
 object RealRoutineActions : RoutineActions {
@@ -361,6 +432,14 @@ object RealRoutineActions : RoutineActions {
         action()
     }
 
+    // Repeats mouse and keyboard actions that were recorded in the PC window (F9 stops it)
+    override fun replay(file: String) {
+        val events = InputRecorder.load(file)
+        if (events.isEmpty()) throw RuntimeException("the recording $file is empty")
+        appLog("  Playing ${events.size} recorded actions (about ${recordingSeconds(events)} s). Press F9 on the PC to stop.")
+        if (!InputRecorder.play(events, robot)) appLog("  Playback stopped with F9")
+    }
+
     override fun valorant() {
         val riot = findRiotClient()
             ?: throw RuntimeException("Riot Client not found. Use:  launch \"<path to RiotClientServices.exe>\" --launch-product=valorant --launch-patchline=live")
@@ -374,6 +453,57 @@ object RealRoutineActions : RoutineActions {
 // How many live connections (WebSockets) are open at the moment, including ones that have not logged in yet
 val liveConnections = AtomicInteger(0)
 
+// ================= SCREEN VIEWING =================
+// How many phones are watching the screen right now (the window shows a warning while it is more than 0)
+object ScreenState {
+    private val counter = AtomicInteger(0)
+    var viewers by mutableStateOf(0)
+        private set
+
+    fun started() { viewers = counter.incrementAndGet() }
+    fun stopped() { viewers = counter.decrementAndGet().coerceAtLeast(0) }
+}
+
+// Sends the screen to one phone as a series of small JPEG pictures, as many as the phone can take.
+// The next picture is only sent after the phone has confirmed the earlier ones (the "a" message in
+// SocketProtocol.kt). On a slow connection pictures are therefore skipped instead of piling up and arriving late.
+suspend fun streamScreen(session: WebSocketSession, settings: SocketCommand.View, inFlight: AtomicInteger) {
+    val screen = primaryScreenBounds()
+    val view = viewRect(settings.zoomPercent, settings.cx, settings.cy)
+    var lastFingerprint = 0
+    var lastSent = 0L
+    while (currentCoroutineContext().isActive) {
+        if (!Guard.allowScreenView) {                       // switched off in the window while watching
+            session.send(Frame.Text("viewdenied"))
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (inFlight.get() >= 2 || now - lastSent < 60) {  // at most about 15 pictures a second
+            delay(5)
+            continue
+        }
+        val picture = try {
+            val shot = robot.createScreenCapture(screen)
+            val p = MouseInfo.getPointerInfo()?.location
+            val cursor = p?.let { Pair((it.x - screen.x).toDouble() / screen.width, (it.y - screen.y).toDouble() / screen.height) }
+            renderScreenPicture(shot, view, settings.width, cursor)
+        } catch (e: Exception) {
+            session.send(Frame.Text("screenerror ${e.message ?: "cannot capture the screen"}"))
+            delay(2000)
+            continue
+        }
+        val fingerprint = pictureFingerprint(picture)
+        if (fingerprint == lastFingerprint && now - lastSent < 2000) {   // nothing changed: send nothing, look again soon
+            delay(120)
+            continue
+        }
+        lastFingerprint = fingerprint
+        lastSent = System.currentTimeMillis()
+        inFlight.incrementAndGet()
+        session.send(Frame.Binary(true, encodeJpeg(picture, settings.quality)))
+    }
+}
+
 fun Application.remoteModule() {
     install(WebSockets) {
         pingPeriodMillis = 15_000     // keeps the connection alive through Cloudflare / routers
@@ -381,8 +511,20 @@ fun Application.remoteModule() {
         maxFrameSize = 4096           // our messages are tiny; anything bigger is refused
     }
     routing {
+        // The plain address (http://<PC IP>:8080 or the https://....trycloudflare.com link) opens the web version
+        // in a browser. Programs that do not ask for a web page (like the page's own status check) still get
+        // the short text answer.
         get("/") {
-            call.respondText("PC Remote server is running")
+            // only a real browser (its User-Agent starts with "Mozilla") gets the page. Apps such as Gesture Operate
+            // also say "text/html" in their Accept header, but they only want the short text.
+            val wantsPage = call.request.headers["Accept"]?.contains("text/html") == true &&
+                    call.request.headers["User-Agent"]?.contains("Mozilla") == true
+            if (wantsPage) {
+                call.response.headers.append("Cache-Control", "no-cache")
+                call.respondText(WEB_APP_HTML, ContentType.Text.Html)
+            } else {
+                call.respondText("PC Remote server is running")
+            }
         }
 
         // ---- Web version of the remote (iPhone Safari, any browser): http://<PC IP>:8080/app ----
@@ -429,6 +571,11 @@ fun Application.remoteModule() {
                 close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "busy"))
                 return@webSocket
             }
+            val session = this
+            var streamJob: Job? = null
+            var viewing = false
+            var buttonHeld = false
+            val inFlight = AtomicInteger(0)      // pictures sent that the phone has not confirmed yet
             try {
                 val id = Guard.clientId(call)
                 val wait = Guard.blockedSeconds(id)
@@ -467,12 +614,95 @@ fun Application.remoteModule() {
                         }
                         is SocketCommand.Scroll -> robot.mouseWheel(command.amount)
                         is SocketCommand.Ping -> send(Frame.Text("q ${command.stamp}"))
+                        is SocketCommand.Point -> {
+                            val screen = primaryScreenBounds()
+                            robot.mouseMove(screen.x + command.x * screen.width / 1000, screen.y + command.y * screen.height / 1000)
+                        }
+                        is SocketCommand.DoubleClick -> {
+                            repeat(2) {
+                                robot.mousePress(InputEvent.BUTTON1_DOWN_MASK)
+                                robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)
+                                robot.delay(40)
+                            }
+                        }
+                        is SocketCommand.Button -> {
+                            if (command.down) robot.mousePress(InputEvent.BUTTON1_DOWN_MASK)
+                            else robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)
+                            buttonHeld = command.down
+                        }
+                        is SocketCommand.Ack -> inFlight.updateAndGet { maxOf(0, it - 1) }
+                        // direct typing from the other device's keyboard (same powers as /keyboard/live and /keyboard/key)
+                        is SocketCommand.TypeText -> liveType(0, command.text)
+                        is SocketCommand.KeyPress -> {
+                            val codes = command.combo.split("+").map { keyCodeFor(it) }
+                            if (codes.none { it == null }) withContext(Dispatchers.IO) { pressCombo(codes.filterNotNull()) }
+                        }
+                        is SocketCommand.View -> {
+                            if (!Guard.allowScreenView) {
+                                send(Frame.Text("viewdenied"))
+                            } else {
+                                streamJob?.cancel()
+                                inFlight.set(0)
+                                if (!viewing) {
+                                    viewing = true
+                                    ScreenState.started()
+                                    appLog("Screen viewing started: $id" + if (Guard.isViaTunnel(call)) " (via the internet)" else "")
+                                }
+                                streamJob = launch(Dispatchers.IO) { streamScreen(session, command, inFlight) }
+                            }
+                        }
+                        is SocketCommand.ViewOff -> {
+                            streamJob?.cancel()
+                            streamJob = null
+                            if (viewing) {
+                                viewing = false
+                                ScreenState.stopped()
+                                appLog("Screen viewing stopped")
+                            }
+                        }
                         null -> { }   // unknown message: ignored
                     }
                 }
             } finally {
+                streamJob?.cancel()
+                if (viewing) {
+                    ScreenState.stopped()
+                    appLog("Screen viewing stopped")
+                }
+                if (buttonHeld) robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)   // never leave the mouse button stuck down
                 liveConnections.decrementAndGet()
             }
+        }
+
+        // ---- Guard mode: block the PC's own mouse and keyboard while you use it from the phone (see GuardMode.kt) ----
+        get("/guard") {
+            if (!call.checkToken()) return@get
+            call.respondText(GuardMode.statusText())          // "off", "nopassword" or "on <wrong passwords typed at the PC>"
+        }
+
+        post("/guard") {
+            if (!call.checkToken()) return@post
+            val on = jsonField(call.receiveText(), "on") == "true"
+            val from = if (Guard.isViaTunnel(call)) "from the phone, via the internet" else "from the phone"
+            try {
+                if (on) GuardMode.turnOn(from) else GuardMode.turnOff(from)
+                call.respondText(if (on) "Guard mode on" else "Guard mode off")
+            } catch (e: Exception) {
+                appLog("Guard mode could not start: ${e.message}")
+                call.respondText(e.message ?: "Guard mode could not start", status = HttpStatusCode.Conflict)
+            }
+        }
+
+        // ---- A message from the phone, shown on the PC (on the lock screen while Guard mode is on) ----
+        post("/message") {
+            if (!call.checkToken()) return@post
+            val text = call.receiveText().trim()
+            if (text.isEmpty()) {
+                call.respondText("The message is empty", status = HttpStatusCode.BadRequest)
+                return@post
+            }
+            GuardMode.showMessage(text)
+            call.respondText("Message shown on the PC")
         }
 
         // ---- Routines (automation): the phone only sends the NAME of a routine ----
@@ -483,6 +713,18 @@ fun Application.remoteModule() {
                 r.id + "\t" + r.name + "\t" + (if (r.isDangerous(Guard.dangerousOverInternet)) "!" else "")
             }
             call.respondText(list)
+        }
+
+        // Is the routine still running? "running", "finished <failed steps>" or "unknown"
+        get("/routine/status") {
+            if (!call.checkToken()) return@get
+            val id = call.request.queryParameters["id"] ?: ""
+            val answer = when {
+                id in RoutineStore.running -> "running"
+                routineResults.containsKey(id) -> "finished ${routineResults[id]}"
+                else -> "unknown"
+            }
+            call.respondText(answer)
         }
 
         post("/routine/run") {
@@ -500,19 +742,8 @@ fun Application.remoteModule() {
                 )
                 return@post
             }
-            if (!RoutineStore.running.add(routine.id)) {
-                call.respondText("Already running: ${routine.name}")
-                return@post
-            }
-            appLog("Routine started: ${routine.name}")
-            routineScope.launch {                       // runs in the background, the phone does not have to wait
-                try {
-                    executeRoutine(routine, RealRoutineActions)
-                } finally {
-                    RoutineStore.running.remove(routine.id)
-                }
-            }
-            call.respondText("Started: ${routine.name}")
+            // runs in the background, the phone does not have to wait
+            call.respondText(startRoutine(routine, if (Guard.isViaTunnel(call)) "phone, via the internet" else "phone"))
         }
 
         // ---- Touchpad: move the mouse by (dx, dy) pixels ----
@@ -526,13 +757,16 @@ fun Application.remoteModule() {
             call.respondText("OK")
         }
 
-        // ---- Touchpad: click ("left" or "right") ----
+        // ---- Touchpad: click ("left", "right" or "double") ----
         post("/mouse/click") {
             if (!call.checkToken()) return@post
-            val button = if (jsonField(call.receiveText(), "button") == "right")
-                InputEvent.BUTTON3_DOWN_MASK else InputEvent.BUTTON1_DOWN_MASK
-            robot.mousePress(button)
-            robot.mouseRelease(button)
+            val which = jsonField(call.receiveText(), "button")
+            val button = if (which == "right") InputEvent.BUTTON3_DOWN_MASK else InputEvent.BUTTON1_DOWN_MASK
+            repeat(if (which == "double") 2 else 1) {
+                robot.mousePress(button)
+                robot.mouseRelease(button)
+                if (which == "double") robot.delay(40)
+            }
             call.respondText("OK")
         }
 
@@ -704,6 +938,63 @@ fun QrCode(text: String, modifier: Modifier = Modifier) {
     }
 }
 
+/** A small trash can, drawn with lines (so no extra icon library is needed). */
+@Composable
+fun TrashIcon(color: Color) {
+    Canvas(modifier = Modifier.size(20.dp)) {
+        val w = size.width
+        val h = size.height
+        val stroke = w * 0.09f
+        drawLine(color, Offset(w * 0.15f, h * 0.25f), Offset(w * 0.85f, h * 0.25f), stroke, StrokeCap.Round)   // lid
+        drawLine(color, Offset(w * 0.38f, h * 0.12f), Offset(w * 0.62f, h * 0.12f), stroke, StrokeCap.Round)   // handle
+        drawLine(color, Offset(w * 0.25f, h * 0.25f), Offset(w * 0.32f, h * 0.9f), stroke, StrokeCap.Round)    // left side
+        drawLine(color, Offset(w * 0.75f, h * 0.25f), Offset(w * 0.68f, h * 0.9f), stroke, StrokeCap.Round)    // right side
+        drawLine(color, Offset(w * 0.32f, h * 0.9f), Offset(w * 0.68f, h * 0.9f), stroke, StrokeCap.Round)     // bottom
+        drawLine(color, Offset(w * 0.43f, h * 0.4f), Offset(w * 0.45f, h * 0.75f), stroke * 0.8f, StrokeCap.Round)
+        drawLine(color, Offset(w * 0.57f, h * 0.4f), Offset(w * 0.55f, h * 0.75f), stroke * 0.8f, StrokeCap.Round)
+    }
+}
+
+// The tabs at the top of the PC window (the same style as the section bar of the phone apps).
+// busy(index) = true shows a small dot: internet on, a routine running, Guard mode on.
+@Composable
+fun PcTabBar(selected: Int, onSelect: (Int) -> Unit, busy: (Int) -> Boolean) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(OtcPanel)
+            .padding(5.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        listOf("Home", "Internet", "Routines", "Security", "Log").forEachIndexed { index, name ->
+            val on = index == selected
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (on) OtcAccent.copy(alpha = 0.16f) else Color.Transparent)
+                    .clickable { onSelect(index) }
+                    .padding(vertical = 10.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    tr(name),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (on) OtcAccent else OtcMuted,
+                    maxLines = 1
+                )
+                if (busy(index)) {
+                    Spacer(Modifier.width(6.dp))
+                    Box(modifier = Modifier.size(7.dp).background(OtcAccent, CircleShape))
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun ServerApp(controller: ServerController) {
     val scope = rememberCoroutineScope()
@@ -717,7 +1008,20 @@ fun ServerApp(controller: ServerController) {
     var tunnelBusy by remember { mutableStateOf(false) }            // true while the tunnel is being started/downloaded
     var askDownload by remember { mutableStateOf(false) }           // show the "download cloudflared?" question
     var allowDanger by remember { mutableStateOf(Guard.allowDangerousOverInternet) }
+    var allowScreen by remember { mutableStateOf(Guard.allowScreenView) }
     var dialogMessage by remember { mutableStateOf<String?>(null) }
+    var showSettings by remember { mutableStateOf(false) }
+    var guardPassword by remember { mutableStateOf("") }
+    var tab by remember { mutableStateOf(0) }                       // 0 Home, 1 Internet, 2 Routines, 3 Security, 4 Log
+    var confirmRoutine by remember { mutableStateOf<Routine?>(null) }   // "run this risky routine?" question
+    var deleteAsk by remember { mutableStateOf<Routine?>(null) }        // "delete this routine?" question
+
+    // recording a routine: countdown (3, 2, 1) -> recording -> finished list waiting for a name
+    var recordCountdown by remember { mutableStateOf(0) }
+    var recording by remember { mutableStateOf(false) }
+    var recordCount by remember { mutableStateOf(0) }
+    var recorded by remember { mutableStateOf<List<RecEvent>?>(null) }
+    var recordName by remember { mutableStateOf("") }
 
     val lines = logLines.toList()
     val listState = rememberLazyListState()
@@ -730,301 +1034,615 @@ fun ServerApp(controller: ServerController) {
         }
     }
 
-    // Scroll the log to the newest line
-    LaunchedEffect(lines.size) {
-        if (lines.isNotEmpty()) listState.animateScrollToItem(lines.size - 1)
+    // Scroll the log to the newest line (only while the Log tab is open)
+    LaunchedEffect(lines.size, tab) {
+        if (tab == 4 && lines.isNotEmpty()) listState.scrollToItem(lines.size - 1)
     }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+            .padding(18.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text(
-            "One Touch Controller",
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Bold
-        )
-
-        // ----- status + start/stop button -----
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Image(painter = rememberAppIcon(), contentDescription = null, modifier = Modifier.size(36.dp))
+            Column {
+                Text("One Touch Controller", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(tr("PC server"), style = MaterialTheme.typography.labelMedium, color = OtcMuted)
+            }
+            Spacer(Modifier.weight(1f))
             Box(
                 modifier = Modifier
-                    .size(14.dp)
-                    .background(if (running) Color(0xFF2E9E4F) else Color.Gray, CircleShape)
+                    .size(10.dp)
+                    .background(if (running) OtcAccent else OtcMuted, CircleShape)
             )
             Text(
-                if (running) "Running (port $PORT)" else "Stopped",
-                style = MaterialTheme.typography.titleMedium
+                if (running) tr("Running (port %1)", PORT) else tr("Stopped"),
+                style = MaterialTheme.typography.labelLarge,
+                color = OtcMuted
             )
-            Spacer(Modifier.weight(1f))
-            Button(
-                enabled = !busy,
-                onClick = {
-                    scope.launch {
-                        busy = true
-                        // start/stop run in the background so the window never freezes
-                        val error = toggleServer(controller)
-                        if (error != null) {
-                            appLog("Start failed: $error")
-                            dialogMessage = "Could not start the server:\n$error\n\n" +
-                                    "Is another copy of the server already running on port $PORT?"
-                        }
-                        addresses = localAddresses()
-                        busy = false
-                    }
-                }
-            ) {
-                Text(if (running) "Stop server" else "Start server")
-            }
+            OutlinedButton(shape = OtcKeyShape, onClick = { showSettings = true }) { Text(tr("Settings")) }
         }
+        if (showSettings) SettingsDialog { showSettings = false }
 
-        // ----- PC address -----
-        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(
-                "Type this IP in the phone app (or tap Find PC):",
-                style = MaterialTheme.typography.bodyMedium
-            )
-            if (addresses.isEmpty()) {
-                Text(
-                    "No network found. Connect to Wi-Fi or turn on the Mobile hotspot.",
-                    color = MaterialTheme.colorScheme.error
-                )
-            } else {
-                addresses.forEach { address ->
-                    Text(address, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+        PcTabBar(
+            selected = tab,
+            onSelect = { tab = it },
+            busy = { index ->
+                when (index) {
+                    1 -> tunnel.active
+                    2 -> runningRoutines.isNotEmpty() || recording
+                    3 -> GuardMode.active
+                    else -> false
                 }
             }
-        }
+        )
 
-        // ----- web version (iPhone / any browser) -----
-        val ips = addresses.map { it.substringBefore(" ") }   // just the IP, without the adapter name
-        if (ips.isNotEmpty()) {
-            // automatic choice: the Windows Mobile Hotspot address (192.168.137.x) if there is one, else the first
-            val autoIndex = ips.indexOfFirst { it.startsWith("192.168.137.") }.let { if (it >= 0) it else 0 }
-            val chosen = if (qrIndex in ips.indices) qrIndex else autoIndex
-            val webUrl = "http://${ips[chosen]}:$PORT/app"
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.CenterVertically
+        // one tab at a time; the long ones can be scrolled
+        when (tab) {
+            0 ->             Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                QrCode(webUrl, Modifier.size(110.dp))
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("iPhone / any browser: scan the code or open", style = MaterialTheme.typography.bodyMedium)
-                    Text(webUrl, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
-                    Text(
-                        "In Safari: Share > Add to Home Screen. You still need the access token below.",
-                        style = MaterialTheme.typography.labelMedium
+                // ----- status + start/stop button -----
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.fillMaxWidth().background(OtcPanel, OtcCardShape).padding(14.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .background(if (running) OtcAccent else OtcMuted, CircleShape)
                     )
-                    if (ips.size > 1) {
-                        TextButton(onClick = { qrIndex = (chosen + 1) % ips.size }) {
-                            Text("Wrong address? Use the next one (${chosen + 1}/${ips.size})")
+                    Text(
+                        if (running) tr("Running (port %1)", PORT) else tr("Stopped"),
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Spacer(Modifier.weight(1f))
+                    Button(
+                        shape = OtcKeyShape,
+                        enabled = !busy,
+                        onClick = {
+                            scope.launch {
+                                busy = true
+                                // start/stop run in the background so the window never freezes
+                                val error = toggleServer(controller)
+                                if (error != null) {
+                                    appLog("Start failed: $error")
+                                    dialogMessage = tr("Could not start the server:\n%1\n\nIs another copy of the server already running on port %2?", error, PORT)
+                                }
+                                addresses = localAddresses()
+                                busy = false
+                            }
+                        }
+                    ) {
+                        Text(if (running) tr("Stop server") else tr("Start server"))
+                    }
+                }
+
+                // ----- PC address -----
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier.fillMaxWidth().background(OtcPanel, OtcCardShape).padding(14.dp)
+                ) {
+                    Text(
+                        tr("Type this IP in the phone app (or tap Find PC):"),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    if (addresses.isEmpty()) {
+                        Text(
+                            tr("No network found. Connect to Wi-Fi or turn on the Mobile hotspot."),
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    } else {
+                        addresses.forEach { address ->
+                            Text(address, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
-            }
-        }
 
-        // ----- token -----
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            OutlinedTextField(
-                value = tokenText,
-                onValueChange = { tokenText = it },
-                label = { Text("Access token") },
-                singleLine = true,
-                modifier = Modifier.weight(1f)
-            )
-            OutlinedButton(onClick = { tokenText = Guard.generateToken() }) {
-                Text("Generate")
-            }
-            Button(onClick = {
-                val newToken = tokenText.trim()
-                if (newToken.isEmpty()) {
-                    dialogMessage = "The token cannot be empty."
-                } else if (tunnel.active && newToken.length < MIN_REMOTE_TOKEN_LENGTH) {
-                    dialogMessage = "Internet access is on, so the token must have at least " +
-                            "$MIN_REMOTE_TOKEN_LENGTH characters. Turn internet access off first, or press Generate."
-                } else {
-                    serverToken = newToken
-                    saveToken()
-                    appLog("Token updated")
-                }
-            }) {
-                Text("Apply token")
-            }
-        }
-
-        // ----- internet access (Cloudflare tunnel) -----
-        Surface(
-            shape = RoundedCornerShape(8.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Internet access (Cloudflare tunnel)", style = MaterialTheme.typography.titleSmall)
-                        Text(tunnel.status, style = MaterialTheme.typography.bodyMedium)
-                    }
-                    Switch(
-                        checked = tunnel.active,
-                        enabled = !tunnelBusy && running,
-                        onCheckedChange = { wantOn ->
-                            if (!wantOn) {
-                                scope.launch(Dispatchers.IO) { tunnel.stop() }
-                            } else if (serverToken.length < MIN_REMOTE_TOKEN_LENGTH) {
-                                dialogMessage = "Internet access needs an access token of at least " +
-                                        "$MIN_REMOTE_TOKEN_LENGTH characters, because anyone on the internet could try to guess it.\n\n" +
-                                        "Press \"Generate\", then \"Apply token\", and enter the new token in your phone app / web page."
-                            } else {
-                                scope.launch {
-                                    tunnelBusy = true
-                                    try {
-                                        val exe = withContext(Dispatchers.IO) { tunnel.findCloudflared() }
-                                        if (exe == null) askDownload = true
-                                        else withContext(Dispatchers.IO) { tunnel.start(exe) }
-                                    } catch (e: Exception) {
-                                        dialogMessage = "Could not start the tunnel:\n${e.message}"
-                                    }
-                                    tunnelBusy = false
+                // ----- web version (iPhone / any browser) -----
+                val ips = addresses.map { it.substringBefore(" ") }   // just the IP, without the adapter name
+                if (ips.isNotEmpty()) {
+                    // automatic choice: the Windows Mobile Hotspot address (192.168.137.x) if there is one, else the first
+                    val autoIndex = ips.indexOfFirst { it.startsWith("192.168.137.") }.let { if (it >= 0) it else 0 }
+                    val chosen = if (qrIndex in ips.indices) qrIndex else autoIndex
+                    val webUrl = "http://${ips[chosen]}:$PORT/app"
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth().background(OtcPanel, OtcCardShape).padding(14.dp)
+                    ) {
+                        QrCode(webUrl, Modifier.size(110.dp))
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(tr("iPhone / any browser: scan the code or open"), style = MaterialTheme.typography.bodyMedium)
+                            Text(webUrl, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                            Text(
+                                tr("In Safari: Share > Add to Home Screen. You still need the access token below."),
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                            if (ips.size > 1) {
+                                TextButton(onClick = { qrIndex = (chosen + 1) % ips.size }) {
+                                    Text(tr("Wrong address? Use the next one (%1/%2)", chosen + 1, ips.size))
                                 }
                             }
                         }
-                    )
-                }
-
-                if (!running) {
-                    Text("Start the server first.", style = MaterialTheme.typography.labelMedium)
-                } else if (serverToken.length < MIN_REMOTE_TOKEN_LENGTH) {
-                    Text(
-                        "Needs an access token with at least $MIN_REMOTE_TOKEN_LENGTH characters (press Generate, then Apply token).",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.error
-                    )
-                }
-
-                val publicUrl = tunnel.url
-                if (publicUrl != null) {
-                    val appUrl = "$publicUrl/app"
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        QrCode(appUrl, Modifier.size(100.dp))
-                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Text("Open on any phone, any network:", style = MaterialTheme.typography.bodyMedium)
-                            Text(appUrl, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                            Text(
-                                "Android app: type " + publicUrl + " in the IP box. You still need the access token.",
-                                style = MaterialTheme.typography.labelMedium
-                            )
-                            OutlinedButton(onClick = {
-                                Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(publicUrl), null)
-                            }) { Text("Copy address") }
-                        }
                     }
                 }
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(
-                        checked = allowDanger,
-                        onCheckedChange = {
-                            allowDanger = it
-                            Guard.allowDangerousOverInternet = it
-                            appLog(if (it) "Shutdown/restart/scripts are now ALLOWED over the internet"
-                            else "Shutdown/restart/scripts are blocked over the internet")
-                        }
+                // ----- token -----
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    OutlinedTextField(
+                        value = tokenText,
+                        onValueChange = { tokenText = it },
+                        label = { Text(tr("Access token")) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
                     )
-                    Text("Allow shutdown, restart and scripts over the internet", style = MaterialTheme.typography.bodyMedium)
+                    OutlinedButton(shape = OtcKeyShape, onClick = { tokenText = Guard.generateToken() }) {
+                        Text(tr("Generate"))
+                    }
+                    Button(shape = OtcKeyShape, onClick = {
+                        val newToken = tokenText.trim()
+                        if (newToken.isEmpty()) {
+                            dialogMessage = tr("The token cannot be empty.")
+                        } else if (tunnel.active && newToken.length < MIN_REMOTE_TOKEN_LENGTH) {
+                            dialogMessage = tr("Internet access is on, so the token must have at least %1 characters. Turn internet access off first, or press Generate.", MIN_REMOTE_TOKEN_LENGTH)
+                        } else {
+                            serverToken = newToken
+                            saveToken()
+                            appLog("Token updated")
+                        }
+                    }) {
+                        Text(tr("Apply token"))
+                    }
                 }
-                Text(
-                    "Anyone who has the address AND the token can control this PC. The address changes every time you turn this on.",
-                    style = MaterialTheme.typography.labelMedium
-                )
             }
-        }
+            1 ->             Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                // ----- internet access (Cloudflare tunnel) -----
+                Surface(
+                    shape = OtcCardShape,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(tr("Internet access (Cloudflare tunnel)"), style = MaterialTheme.typography.titleSmall)
+                                Text(tr(tunnel.status), style = MaterialTheme.typography.bodyMedium)
+                            }
+                            Switch(
+                                checked = tunnel.active,
+                                enabled = !tunnelBusy && running,
+                                onCheckedChange = { wantOn ->
+                                    if (!wantOn) {
+                                        scope.launch(Dispatchers.IO) { tunnel.stop() }
+                                    } else if (serverToken.length < MIN_REMOTE_TOKEN_LENGTH) {
+                                        dialogMessage = tr("Internet access needs an access token of at least %1 characters, because anyone on the internet could try to guess it.\n\nPress \"Generate\", then \"Apply token\", and enter the new token in your phone app / web page.", MIN_REMOTE_TOKEN_LENGTH)
+                                    } else {
+                                        scope.launch {
+                                            tunnelBusy = true
+                                            try {
+                                                val exe = withContext(Dispatchers.IO) { tunnel.findCloudflared() }
+                                                if (exe == null) askDownload = true
+                                                else withContext(Dispatchers.IO) { tunnel.start(exe) }
+                                            } catch (e: Exception) {
+                                                dialogMessage = tr("Could not start the tunnel:\n%1", e.message)
+                                            }
+                                            tunnelBusy = false
+                                        }
+                                    }
+                                }
+                            )
+                        }
 
-        // ----- automation routines -----
-        Surface(
-            shape = RoundedCornerShape(8.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Automation routines", style = MaterialTheme.typography.titleSmall)
+                        if (!running) {
+                            Text(tr("Start the server first."), style = MaterialTheme.typography.labelMedium)
+                        } else if (serverToken.length < MIN_REMOTE_TOKEN_LENGTH) {
+                            Text(
+                                tr("Needs an access token with at least %1 characters (press Generate, then Apply token).", MIN_REMOTE_TOKEN_LENGTH),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+
+                        val publicUrl = tunnel.url
+                        if (publicUrl != null) {
+                            val appUrl = "$publicUrl/app"
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                QrCode(appUrl, Modifier.size(100.dp))
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(tr("Open on any phone, any network:"), style = MaterialTheme.typography.bodyMedium)
+                                    Text(appUrl, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                    Text(
+                                        tr("Android app: type %1 in the IP box. You still need the access token.", publicUrl),
+                                        style = MaterialTheme.typography.labelMedium
+                                    )
+                                    OutlinedButton(shape = OtcKeyShape, onClick = {
+                                        Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(publicUrl), null)
+                                    }) { Text(tr("Copy address")) }
+                                }
+                            }
+                        }
+
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = allowDanger,
+                                onCheckedChange = {
+                                    allowDanger = it
+                                    Guard.allowDangerousOverInternet = it
+                                    appLog(if (it) "Shutdown/restart/scripts are now ALLOWED over the internet"
+                                    else tr("Shutdown/restart/scripts are blocked over the internet"))
+                                }
+                            )
+                            Text(tr("Allow shutdown, restart and scripts over the internet"), style = MaterialTheme.typography.bodyMedium)
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = allowScreen,
+                                onCheckedChange = {
+                                    allowScreen = it
+                                    Guard.allowScreenView = it
+                                    appLog(if (it) "Screen viewing is now ALLOWED" else "Screen viewing is turned off")
+                                }
+                            )
+                            Text(tr("Allow viewing this PC's screen from a phone"), style = MaterialTheme.typography.bodyMedium)
+                        }
+                        if (ScreenState.viewers > 0) {
+                            Text(
+                                tr("A phone is viewing this PC's screen right now"),
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.labelLarge
+                            )
+                        }
                         Text(
-                            if (RoutineStore.routines.isEmpty()) "None loaded" else RoutineStore.routines.joinToString(", ") { it.name },
-                            style = MaterialTheme.typography.bodyMedium,
-                            maxLines = 1
+                            tr("Anyone who has the address AND the token can control this PC. The address changes every time you turn this on."),
+                            style = MaterialTheme.typography.labelMedium
                         )
                     }
-                    OutlinedButton(onClick = {
-                        try {
-                            ProcessBuilder("notepad.exe", RoutineStore.file.absolutePath).start()
-                        } catch (e: Exception) {
-                            dialogMessage = "Could not open Notepad. The file is here:\n${RoutineStore.file.absolutePath}"
-                        }
-                    }) { Text("Edit file") }
-                    OutlinedButton(onClick = { reloadRoutines() }) { Text("Reload") }
-                }
-                RoutineStore.problems.take(3).forEach {
-                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium)
                 }
             }
-        }
-
-        // ----- activity log -----
-        Text("Activity log", style = MaterialTheme.typography.titleSmall)
-        Surface(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth(),
-            shape = RoundedCornerShape(8.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant
-        ) {
-            LazyColumn(
-                state = listState,
-                contentPadding = PaddingValues(8.dp)
+            2 ->             Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                items(lines.size) { index ->
-                    Text(
-                        lines[index],
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 12.sp
-                    )
+                // ----- the routines, each with its own Run button -----
+                Surface(
+                    shape = OtcCardShape,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(tr("Automation routines"), style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    tr("Run a routine here or from your phone."),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = OtcMuted
+                                )
+                            }
+                            OutlinedButton(shape = OtcKeyShape, onClick = {
+                                try {
+                                    ProcessBuilder("notepad.exe", RoutineStore.file.absolutePath).start()
+                                } catch (e: Exception) {
+                                    dialogMessage = tr("Could not open Notepad. The file is here:\n%1", RoutineStore.file.absolutePath)
+                                }
+                            }) { Text(tr("Edit file")) }
+                            OutlinedButton(shape = OtcKeyShape, onClick = { reloadRoutines() }) { Text(tr("Reload")) }
+                        }
+                        if (RoutineStore.routines.isEmpty()) {
+                            Text(
+                                tr("No routines yet. Press \"Edit file\" to write one, or record a task below."),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = OtcMuted
+                            )
+                        }
+                        RoutineStore.routines.forEach { routine ->
+                            val isRunning = routine.id in runningRoutines
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(OtcInk, OtcKeyShape)
+                                    .padding(start = 14.dp, end = 8.dp, top = 8.dp, bottom = 8.dp)
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(routine.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        tr("%1 steps", routine.steps.size) + ": " + routine.steps.take(3).joinToString(", ") { describeStep(it) } +
+                                                (if (routine.steps.size > 3) ", ..." else ""),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = OtcMuted,
+                                        maxLines = 1
+                                    )
+                                }
+                                Button(
+                                    shape = OtcKeyShape,
+                                    enabled = !isRunning,
+                                    onClick = {
+                                        if (routine.isDangerous(Guard.dangerousOverInternet)) confirmRoutine = routine
+                                        else startRoutine(routine, "PC window")
+                                    }
+                                ) { Text(if (isRunning) tr("Running...") else tr("Run")) }
+                                // delete (trash can)
+                                IconButton(enabled = !isRunning, onClick = { deleteAsk = routine }) {
+                                    TrashIcon(if (isRunning) OtcMuted.copy(alpha = 0.4f) else OtcDanger)
+                                }
+                            }
+                        }
+                        RoutineStore.problems.take(3).forEach {
+                            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                }
+
+                // ----- record a routine -----
+                Surface(
+                    shape = OtcCardShape,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        // ----- record a routine: do the task once by hand, the PC repeats it later -----
+                        Text(tr("Record a task"), style = MaterialTheme.typography.titleSmall)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                when {
+                                    recording -> tr("Recording: %1 actions so far. Press F9 or Stop when the task is finished.", recordCount)
+                                    recordCountdown > 0 -> tr("Recording starts in %1...", recordCountdown)
+                                    else -> tr("Record a task once (mouse and keyboard) and run it again from here or from your phone.")
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = if (recording) OtcAccent else OtcMuted,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Button(
+                                shape = OtcKeyShape,
+                                enabled = recording || (recordCountdown == 0 && recorded == null),
+                                onClick = {
+                                    if (recording) {                   // the Stop button: works even if F9 does not
+                                        InputRecorder.stop(fromButton = true)
+                                        return@Button
+                                    }
+                                    scope.launch {
+                                        for (n in 3 downTo 1) { recordCountdown = n; delay(1000) }
+                                        recordCountdown = 0
+                                        try {
+                                            recordCount = 0
+                                            InputRecorder.start(
+                                                progress = { recordCount = it },
+                                                stopped = { events -> recording = false; recorded = events; recordName = "" }
+                                            )
+                                            recording = true
+                                            appLog("Recording started (F9 stops it)")
+                                        } catch (e: Throwable) {
+                                            dialogMessage = tr("Could not start recording:\n%1", e.message ?: e.javaClass.simpleName)
+                                        }
+                                    }
+                                }
+                            ) { Text(if (recording) tr("Stop") else tr("Record")) }
+                        }
+                    }
                 }
             }
-        }
+            3 ->             Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                // ----- Guard mode: block the PC's own mouse and keyboard while you are away -----
+                Surface(
+                    shape = OtcCardShape,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(tr("Guard mode"), style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    when {
+                                        GuardMode.active -> tr("On: the PC's own mouse and keyboard are blocked. Your phone still works.")
+                                        GuardMode.hasPassword -> tr("Off. Turn it on from your phone when you leave the PC.")
+                                        else -> tr("Set a Guard password first.")
+                                    },
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = if (GuardMode.active) OtcAccent else OtcMuted
+                                )
+                            }
+                            Button(
+                                shape = OtcKeyShape,
+                                enabled = GuardMode.hasPassword || GuardMode.active,
+                                onClick = {
+                                    try {
+                                        if (GuardMode.active) GuardMode.turnOff("from the PC window") else GuardMode.turnOn("from the PC window")
+                                    } catch (e: Exception) {
+                                        dialogMessage = tr(e.message ?: "Guard mode could not start")
+                                    }
+                                }
+                            ) { Text(if (GuardMode.active) tr("Turn off") else tr("Turn on")) }
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(
+                                value = guardPassword,
+                                onValueChange = { guardPassword = it.filter { c -> c.isLetterOrDigit() }.take(GuardPassword.MAX_LENGTH) },
+                                label = { Text(if (GuardMode.hasPassword) tr("New Guard password") else tr("Guard password")) },
+                                singleLine = true,
+                                visualTransformation = PasswordVisualTransformation(),
+                                modifier = Modifier.weight(1f)
+                            )
+                            OutlinedButton(shape = OtcKeyShape, onClick = {
+                                val problem = GuardMode.setPassword(guardPassword)
+                                if (problem == null) {
+                                    guardPassword = ""
+                                    appLog("Guard password saved")
+                                    dialogMessage = tr("Guard password saved.")
+                                } else {
+                                    dialogMessage = problem
+                                }
+                            }) { Text(tr("Save password")) }
+                        }
+                        Text(
+                            tr("Letters and numbers, 4 to 32, capital letters do not matter. Anyone at the PC must type it to unlock. Ctrl+Alt+Del and holding the power button cannot be blocked by any program."),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = OtcMuted
+                        )
+                    }
+                }
+            }
+            else -> Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // ----- activity log -----
+                Text(tr("Activity log"), style = MaterialTheme.typography.titleSmall)
+                Surface(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    shape = OtcCardShape,
+                    color = MaterialTheme.colorScheme.surfaceVariant
+                ) {
+                    LazyColumn(
+                        state = listState,
+                        contentPadding = PaddingValues(8.dp)
+                    ) {
+                        items(lines.size) { index ->
+                            Text(
+                                lines[index],
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
 
-        OutlinedButton(
-            onClick = { synchronized(logLines) { logLines.clear() } },
-            modifier = Modifier.align(Alignment.End)
-        ) {
-            Text("Clear log")
+                OutlinedButton(
+                    shape = OtcKeyShape,
+                    onClick = { synchronized(logLines) { logLines.clear() } },
+                    modifier = Modifier.align(Alignment.End)
+                ) {
+                    Text(tr("Clear log"))
+                }
+            }
         }
     }
 
+    // ----- "run this routine?" for routines with shutdown / restart / script steps -----
+    confirmRoutine?.let { routine ->
+        AlertDialog(
+            onDismissRequest = { confirmRoutine = null },
+            title = { Text(tr("Are you sure?")) },
+            text = { Text(tr("Run \"%1\" on this PC? It contains shutdown, restart or script steps.", routine.name)) },
+            confirmButton = {
+                TextButton(onClick = { startRoutine(routine, "PC window"); confirmRoutine = null }) { Text(tr("Run")) }
+            },
+            dismissButton = { TextButton(onClick = { confirmRoutine = null }) { Text(tr("Cancel")) } }
+        )
+    }
+
+    // ----- "delete this routine?" -----
+    deleteAsk?.let { routine ->
+        val recorded = routine.steps.any { it is Step.Replay }
+        AlertDialog(
+            onDismissRequest = { deleteAsk = null },
+            title = { Text(tr("Delete \"%1\"?", routine.name)) },
+            text = {
+                Text(
+                    if (recorded) tr("The routine and its recording are deleted. This cannot be undone.")
+                    else tr("The routine is removed from the routines file. This cannot be undone.")
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    deleteAsk = null
+                    deleteRoutine(routine)?.let { dialogMessage = it }
+                }) { Text(tr("Delete"), color = OtcDanger) }
+            },
+            dismissButton = { TextButton(onClick = { deleteAsk = null }) { Text(tr("Cancel")) } }
+        )
+    }
+
     // ----- "download cloudflared?" question -----
+    // ----- a recording was finished: ask for a name and save it as a routine -----
+    recorded?.let { events ->
+        AlertDialog(
+            onDismissRequest = { },
+            title = { Text(if (events.isEmpty()) tr("Nothing was recorded") else tr("Save this routine?")) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (events.isEmpty()) {
+                        Text(tr("No mouse or keyboard action arrived before F9 was pressed."))
+                    } else {
+                        Text(tr("%1 actions, about %2 seconds. It will appear in the Routines list of the remote apps.", events.size, recordingSeconds(events)))
+                        OutlinedTextField(
+                            value = recordName,
+                            onValueChange = { recordName = it.replace("\n", " ").take(40) },
+                            label = { Text(tr("Name of the routine")) },
+                            singleLine = true
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                if (events.isNotEmpty()) TextButton(
+                    enabled = recordName.isNotBlank(),
+                    onClick = {
+                        try {
+                            val name = recordName.trim()
+                            val taken = RoutineStore.routines.map { it.id }.toSet() +
+                                    (InputRecorder.folder.list()?.map { it.removeSuffix(".rec") } ?: emptyList())
+                            val id = recordingId(name, taken)
+                            InputRecorder.save(id, events)
+                            RoutineStore.file.parentFile?.mkdirs()
+                            RoutineStore.file.appendText("\n[$id] $name\nreplay $id.rec\n")
+                            reloadRoutines()
+                            appLog("Saved the recorded routine \"$name\"")
+                        } catch (e: Exception) {
+                            dialogMessage = tr("Could not save the routine:\n%1", e.message)
+                        }
+                        recorded = null
+                    }
+                ) { Text(tr("Save")) }
+            },
+            dismissButton = {
+                TextButton(onClick = { recorded = null }) { Text(if (events.isEmpty()) tr("OK") else tr("Discard")) }
+            }
+        )
+    }
+
     if (askDownload) {
         AlertDialog(
             onDismissRequest = { askDownload = false },
-            title = { Text("Download cloudflared?") },
+            title = { Text(tr("Download cloudflared?")) },
             text = {
                 Text(
-                    "Internet access needs the free program \"cloudflared\" from Cloudflare (about 55 MB).\n\n" +
-                            "It will be downloaded from github.com/cloudflare/cloudflared and saved in your user folder (.onetouch). " +
-                            "Download it now?"
+                    tr("Internet access needs the free program \"cloudflared\" from Cloudflare (about 55 MB).\n\nIt will be downloaded from github.com/cloudflare/cloudflared and saved in your user folder (.onetouch). Download it now?")
                 )
             },
             confirmButton = {
@@ -1035,13 +1653,13 @@ fun ServerApp(controller: ServerController) {
                         try {
                             withContext(Dispatchers.IO) { tunnel.start(tunnel.download()) }
                         } catch (e: Exception) {
-                            dialogMessage = "Download failed:\n${e.message}"
+                            dialogMessage = tr("Download failed:\n%1", e.message)
                         }
                         tunnelBusy = false
                     }
-                }) { Text("Download") }
+                }) { Text(tr("Download")) }
             },
-            dismissButton = { TextButton(onClick = { askDownload = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { askDownload = false }) { Text(tr("Cancel")) } }
         )
     }
 
@@ -1049,24 +1667,53 @@ fun ServerApp(controller: ServerController) {
     dialogMessage?.let { message ->
         AlertDialog(
             onDismissRequest = { dialogMessage = null },
-            title = { Text("Notice") },
+            title = { Text(tr("Notice")) },
             text = { Text(message) },
             confirmButton = {
-                TextButton(onClick = { dialogMessage = null }) { Text("OK") }
+                TextButton(onClick = { dialogMessage = null }) { Text(tr("OK")) }
             }
         )
     }
 }
 
-// ================= ICON (drawn with code, used for the window and the tray) =================
-val appIcon: Painter = object : Painter() {
+// ================= DESIGN (the same look as the phone app and the web version) =================
+// (the colours OtcInk, OtcPanel, OtcAccent, ... are in Settings.kt, because they follow the settings)
+
+val OtcKeyShape = RoundedCornerShape(12.dp)
+val OtcCardShape = RoundedCornerShape(16.dp)
+
+val OtcPcShapes = Shapes(
+    extraSmall = RoundedCornerShape(10.dp),
+    small = RoundedCornerShape(10.dp),
+    medium = RoundedCornerShape(12.dp),
+    large = RoundedCornerShape(16.dp),
+    extraLarge = RoundedCornerShape(20.dp)
+)
+
+// ================= ICON (drawn with code, used for the window, the taskbar and the tray) =================
+/** A tile in [tile] colour with a power symbol in [ink] colour. */
+fun appIconPainter(tile: Color, ink: Color): Painter = object : Painter() {
     override val intrinsicSize: Size = Size(256f, 256f)
 
     override fun DrawScope.onDraw() {
-        drawRoundRect(Color(0xFF1E3A8A), cornerRadius = CornerRadius(size.minDimension / 5f))
-        drawCircle(Color.White, radius = size.minDimension / 4f, style = Stroke(width = size.minDimension / 14f))
-        drawCircle(Color.White, radius = size.minDimension / 12f)
+        val d = size.minDimension
+        val w = d / 11f
+        drawRoundRect(tile, cornerRadius = CornerRadius(d / 4.2f))
+        drawArc(
+            color = ink, startAngle = -60f, sweepAngle = 300f, useCenter = false,
+            topLeft = Offset(d * 0.26f, d * 0.28f), size = Size(d * 0.48f, d * 0.48f),
+            style = Stroke(width = w, cap = StrokeCap.Round)
+        )
+        drawLine(ink, Offset(d / 2f, d * 0.2f), Offset(d / 2f, d * 0.5f), strokeWidth = w, cap = StrokeCap.Round)
     }
+}
+
+/** The icon in the accent colour chosen in Settings. It is drawn again when the colour or the theme changes. */
+@Composable
+fun rememberAppIcon(): Painter {
+    val tile = OtcAccent
+    val ink = OtcAccentInk
+    return remember(tile, ink) { appIconPainter(tile, ink) }
 }
 
 // Starts the server if it is stopped, stops it if it is running.
@@ -1082,10 +1729,12 @@ suspend fun toggleServer(controller: ServerController): String? = withContext(Di
 
 // ================= START THE PROGRAM =================
 fun main() {
+    Look.load()      // theme, accent colour and language of the window
     System.setProperty("java.awt.headless", "false") // needed so Robot and the window work
     loadToken()
     reloadRoutines()
     appLog = { message -> addLog(message) }
+    GuardMode.load()     // Guard password; also repairs the power button if the program was closed while guarding
     val controller = ServerController()
 
     // The server starts automatically. You can still stop it with the button or the tray menu.
@@ -1107,17 +1756,20 @@ fun main() {
             exitApplication()
         }
 
+        // the same icon in the window title, the taskbar and the tray (follows the accent colour)
+        val icon = rememberAppIcon()
+
         // ----- system tray icon (next to the clock) -----
         if (isTraySupported) {
             Tray(
-                icon = appIcon,
+                icon = icon,
                 state = trayState,
-                tooltip = if (controller.running) "One Touch Controller - running" else "One Touch Controller - stopped",
+                tooltip = if (controller.running) tr("One Touch Controller - running") else tr("One Touch Controller - stopped"),
                 onAction = { windowVisible = true },   // click on the icon = open the window
                 menu = {
-                    Item("Open window", onClick = { windowVisible = true })
+                    Item(tr("Open window"), onClick = { windowVisible = true })
                     Item(
-                        if (controller.running) "Stop server" else "Start server",
+                        if (controller.running) tr("Stop server") else tr("Start server"),
                         onClick = {
                             scope.launch {
                                 val error = toggleServer(controller)
@@ -1126,7 +1778,7 @@ fun main() {
                         }
                     )
                     Separator()
-                    Item("Exit", onClick = { exitProgram() })
+                    Item(tr("Exit"), onClick = { exitProgram() })
                 }
             )
         }
@@ -1141,7 +1793,7 @@ fun main() {
                         trayState.sendNotification(
                             Notification(
                                 "One Touch Controller",
-                                "Still running in the system tray. Right-click the icon to exit."
+                                tr("Still running in the system tray. Right-click the icon to exit.")
                             )
                         )
                     }
@@ -1151,11 +1803,11 @@ fun main() {
             },
             visible = windowVisible,
             title = "One Touch Controller - PC Server",
-            icon = appIcon,
-            state = rememberWindowState(width = 640.dp, height = 900.dp)
+            icon = icon,
+            state = rememberWindowState(width = 720.dp, height = 780.dp)
         ) {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
+            MaterialTheme(colorScheme = otcPcColorScheme(), shapes = OtcPcShapes) {
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     ServerApp(controller)
                 }
             }

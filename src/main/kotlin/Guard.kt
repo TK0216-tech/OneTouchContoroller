@@ -16,6 +16,10 @@ object Guard {
     @Volatile
     var allowDangerousOverInternet = false
 
+    // Switch in the PC window: may a phone look at this PC's screen? (works for the local network and the internet)
+    @Volatile
+    var allowScreenView = true
+
     private const val MAX_FAILS = 5                       // wrong tokens in a row ...
     private const val WINDOW_MS = 10 * 60 * 1000L        // ... within 10 minutes ...
     private const val BLOCK_MS = 5 * 60 * 1000L          // ... = blocked for 5 minutes

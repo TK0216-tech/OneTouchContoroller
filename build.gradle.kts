@@ -22,6 +22,9 @@ dependencies {
     implementation("io.ktor:ktor-server-websockets-jvm:3.0.3")   // fast live connection for the touchpad
     implementation("org.slf4j:slf4j-simple:2.0.16")
     implementation("com.google.zxing:core:3.5.3")   // draws the QR code for the web version
+    implementation("com.github.kwhat:jnativehook:2.2.2")   // hears the mouse and keyboard while a routine is recorded
+    implementation("net.java.dev.jna:jna:5.15.0")            // Guard mode: talks to Windows (block mouse and keyboard)
+    implementation("net.java.dev.jna:jna-platform:5.15.0")
 }
 
 compose.desktop {
@@ -37,7 +40,7 @@ compose.desktop {
             vendor = "THANT SIN OO"
 
             // Java parts that the packaged program needs (Netty/Ktor use these)
-            modules("java.instrument", "java.management", "java.naming", "java.net.http", "java.sql", "jdk.unsupported")
+            modules("java.instrument", "java.management", "java.naming", "java.net.http", "java.sql", "java.logging", "jdk.unsupported")
 
             windows {
                 iconFile.set(project.file("icon.ico"))   // icon.ico must be in the project folder
