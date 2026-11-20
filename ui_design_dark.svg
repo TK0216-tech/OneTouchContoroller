@@ -1,0 +1,362 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 760" width="1120" height="760">
+  <defs>
+    <!-- Fonts & Styles -->
+    <style>
+      .font-sans { font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif; }
+      .font-mono { font-family: 'Cascadia Code', 'JetBrains Mono', 'Consolas', monospace; }
+      .card { fill: #15162B; stroke: #252746; stroke-width: 1; }
+      .card-inner { fill: #0B0B17; stroke: #1F213D; stroke-width: 1; }
+      .badge-running { fill: rgba(16, 185, 129, 0.12); stroke: #10B981; stroke-width: 1; }
+      .btn-primary { fill: url(#primaryGrad); }
+      .btn-danger { fill: rgba(239, 68, 68, 0.14); stroke: #EF4444; stroke-width: 1; }
+      .btn-ghost { fill: #1A1C36; stroke: #2E325B; stroke-width: 1; }
+      .text-main { fill: #F8FAFC; }
+      .text-sub { fill: #94A3B8; }
+      .text-muted { fill: #64748B; }
+      .text-accent { fill: #818CF8; }
+      .text-emerald { fill: #34D399; }
+    </style>
+
+    <!-- Background & Accent Gradients -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0E0E1D" />
+      <stop offset="100%" stop-color="#090914" />
+    </linearGradient>
+
+    <linearGradient id="primaryGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#6366F1" />
+      <stop offset="100%" stop-color="#8B5CF6" />
+    </linearGradient>
+
+    <linearGradient id="headerGlow" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#6366F1" stop-opacity="0.18" />
+      <stop offset="50%" stop-color="#8B5CF6" stop-opacity="0.05" />
+      <stop offset="100%" stop-color="#0E0E1D" stop-opacity="0" />
+    </linearGradient>
+
+    <radialGradient id="ambientGlow1" cx="15%" cy="15%" r="45%">
+      <stop offset="0%" stop-color="#4F46E5" stop-opacity="0.12" />
+      <stop offset="100%" stop-color="#0E0E1D" stop-opacity="0" />
+    </radialGradient>
+
+    <radialGradient id="ambientGlow2" cx="85%" cy="85%" r="45%">
+      <stop offset="0%" stop-color="#7C3AED" stop-opacity="0.10" />
+      <stop offset="100%" stop-color="#0E0E1D" stop-opacity="0" />
+    </radialGradient>
+
+    <filter id="dropShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.45" />
+    </filter>
+
+    <filter id="glowGreen" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="3.5" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- ================= WINDOW BACKGROUND ================= -->
+  <rect width="1120" height="760" rx="12" fill="url(#bgGrad)" stroke="#262846" stroke-width="1.5" />
+  <rect width="1120" height="760" rx="12" fill="url(#ambientGlow1)" />
+  <rect width="1120" height="760" rx="12" fill="url(#ambientGlow2)" />
+
+  <!-- ================= CUSTOM WINDOW TITLE BAR ================= -->
+  <g>
+    <path d="M 12 0 H 1108 A 12 12 0 0 1 1120 12 V 42 H 0 V 12 A 12 12 0 0 1 12 0 Z" fill="#0A0A15" />
+    <line x1="0" y1="42" x2="1120" y2="42" stroke="#1E203B" stroke-width="1" />
+
+    <!-- App Icon in Titlebar -->
+    <g transform="translate(18, 11)">
+      <rect width="20" height="20" rx="5" fill="url(#primaryGrad)" />
+      <circle cx="10" cy="10" r="5.5" fill="none" stroke="#FFFFFF" stroke-width="1.8" />
+      <circle cx="10" cy="10" r="2" fill="#FFFFFF" />
+    </g>
+    <text x="48" y="26" class="font-sans text-sub" font-size="12.5" font-weight="500">One Touch Controller — PC Server</text>
+
+    <!-- Tray status indicator in Titlebar -->
+    <g transform="translate(880, 11)">
+      <rect width="110" height="20" rx="10" fill="#141529" stroke="#252746" stroke-width="1" />
+      <circle cx="12" cy="10" r="3" fill="#818CF8" />
+      <text x="22" y="14" class="font-sans text-sub" font-size="11">Tray Active</text>
+    </g>
+
+    <!-- Window Controls (Minimize, Maximize, Close) -->
+    <g transform="translate(1015, 0)">
+      <line x1="14" y1="21" x2="24" y2="21" stroke="#94A3B8" stroke-width="1.2" />
+      <rect x="48" y="16" width="10" height="10" rx="1.5" fill="none" stroke="#94A3B8" stroke-width="1.2" />
+      <g transform="translate(82, 16)">
+        <line x1="0" y1="0" x2="10" y2="10" stroke="#94A3B8" stroke-width="1.2" />
+        <line x1="10" y1="0" x2="0" y2="10" stroke="#94A3B8" stroke-width="1.2" />
+      </g>
+    </g>
+  </g>
+
+  <!-- ================= TOP HEADER / SERVER STATUS BAR ================= -->
+  <g transform="translate(32, 64)" filter="url(#dropShadow)">
+    <rect width="1056" height="84" rx="16" class="card" />
+    <rect width="600" height="84" rx="16" fill="url(#headerGlow)" />
+
+    <!-- Brand Icon -->
+    <g transform="translate(24, 18)">
+      <rect width="48" height="48" rx="12" fill="url(#primaryGrad)" />
+      <circle cx="24" cy="24" r="13" fill="none" stroke="#FFFFFF" stroke-width="3.2" />
+      <circle cx="24" cy="24" r="4.5" fill="#FFFFFF" />
+    </g>
+
+    <!-- Title & Subtitle -->
+    <text x="88" y="39" class="font-sans text-main" font-size="22" font-weight="700" letter-spacing="0.3">One Touch Controller</text>
+    <text x="88" y="61" class="font-sans text-sub" font-size="13">Remote Control &amp; Automation Server for Mobile Devices</text>
+
+    <!-- Port & Discovery Info -->
+    <g transform="translate(535, 22)">
+      <!-- HTTP Port Pill -->
+      <rect x="0" y="0" width="136" height="40" rx="10" class="card-inner" />
+      <text x="16" y="17" class="font-sans text-muted" font-size="10" font-weight="600" letter-spacing="0.6">HTTP PORT</text>
+      <text x="16" y="32" class="font-mono text-main" font-size="13" font-weight="600">8080 <tspan class="text-sub" font-size="11" font-weight="400">/ TCP</tspan></text>
+
+      <!-- UDP Discovery Pill -->
+      <rect x="148" y="0" width="150" height="40" rx="10" class="card-inner" />
+      <text x="164" y="17" class="font-sans text-muted" font-size="10" font-weight="600" letter-spacing="0.6">AUTO-DISCOVERY</text>
+      <text x="164" y="32" class="font-mono text-accent" font-size="13" font-weight="600">8888 <tspan class="text-sub" font-size="11" font-weight="400">/ UDP</tspan></text>
+    </g>
+
+    <!-- Running Status Badge -->
+    <g transform="translate(852, 24)">
+      <rect width="78" height="36" rx="18" class="badge-running" />
+      <circle cx="18" cy="18" r="5" fill="#10B981" filter="url(#glowGreen)" />
+      <text x="30" y="23" class="font-sans text-emerald" font-size="12.5" font-weight="600">Online</text>
+    </g>
+
+    <!-- Stop Server Button -->
+    <g transform="translate(942, 22)">
+      <rect width="94" height="40" rx="10" class="btn-danger" />
+      <rect x="16" y="15" width="10" height="10" rx="2" fill="#F87171" />
+      <text x="33" y="25" class="font-sans" fill="#FCA5A5" font-size="13" font-weight="600">Stop</text>
+    </g>
+  </g>
+
+  <!-- ================= MAIN CONTENT GRID ================= -->
+
+  <!-- ========== LEFT COLUMN: CONNECTION & SECURITY ========== -->
+  <g transform="translate(32, 168)">
+
+    <!-- CARD 1: NETWORK & WEB APP QR -->
+    <g filter="url(#dropShadow)">
+      <rect width="460" height="384" rx="16" class="card" />
+
+      <!-- Section Header -->
+      <g transform="translate(24, 24)">
+        <!-- Wifi/Network Icon -->
+        <path d="M2 8.5C6.5 4 13.5 4 18 8.5M5 11.5C8 8.5 12 8.5 15 11.5M8.5 15C9.5 14 10.5 14 11.5 15M10 18H10.01" stroke="#818CF8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none" />
+        <text x="30" y="15" class="font-sans text-main" font-size="15" font-weight="700">Device Connection</text>
+        <text x="0" y="38" class="font-sans text-sub" font-size="12.5">Type this IP in the phone app (or tap <tspan fill="#E2E8F0" font-weight="600">Find PC</tspan>):</text>
+      </g>
+
+      <!-- IP Address List Box -->
+      <g transform="translate(24, 80)">
+        <rect width="412" height="58" rx="12" class="card-inner" stroke="#312E81" />
+        <!-- Active Indicator Bar -->
+        <rect x="0" y="12" width="4" height="34" rx="2" fill="#6366F1" />
+
+        <text x="18" y="26" class="font-mono text-main" font-size="16" font-weight="700" letter-spacing="0.5">172.20.10.4</text>
+        <text x="18" y="45" class="font-sans text-sub" font-size="12">Apple Mobile Device Ethernet</text>
+
+        <!-- Copy IP Button -->
+        <g transform="translate(332, 13)">
+          <rect width="66" height="32" rx="8" class="btn-ghost" />
+          <text x="33" y="21" text-anchor="middle" class="font-sans text-sub" font-size="11.5" font-weight="600">Copy IP</text>
+        </g>
+      </g>
+
+      <!-- Divider -->
+      <line x1="24" y1="158" x2="436" y2="158" stroke="#222442" stroke-width="1" />
+
+      <!-- QR Code & Web Remote Section -->
+      <g transform="translate(24, 178)">
+        <!-- QR Code Container (High-contrast white frame for reliable scanning) -->
+        <rect x="0" y="0" width="144" height="144" rx="14" fill="#FFFFFF" stroke="#312E81" stroke-width="2" />
+        
+        <!-- Stylized Accurate QR Matrix inside White Frame -->
+        <g transform="translate(14, 14)" fill="#0E0E1D">
+          <!-- Top-Left Finder Pattern -->
+          <path d="M0,0 h32 v32 h-32 z M5,5 v22 h22 v-22 z M10,10 h12 v12 h-12 z" />
+          <!-- Top-Right Finder Pattern -->
+          <path d="M84,0 h32 v32 h-32 z M89,5 v22 h22 v-22 z M94,10 h12 v12 h-12 z" />
+          <!-- Bottom-Left Finder Pattern -->
+          <path d="M0,84 h32 v32 h-32 z M5,89 v22 h22 v-22 z M10,94 h12 v12 h-12 z" />
+          
+          <!-- QR Data Modules (Representative Pattern) -->
+          <rect x="40" y="0" width="6" height="6" />
+          <rect x="52" y="0" width="12" height="6" />
+          <rect x="70" y="0" width="6" height="12" />
+          <rect x="40" y="12" width="12" height="6" />
+          <rect x="58" y="12" width="6" height="12" />
+          <rect x="46" y="24" width="6" height="6" />
+          <rect x="64" y="24" width="12" height="6" />
+
+          <rect x="0" y="40" width="6" height="12" />
+          <rect x="12" y="46" width="12" height="6" />
+          <rect x="30" y="40" width="12" height="12" />
+          <rect x="48" y="40" width="6" height="6" />
+          <rect x="60" y="46" width="18" height="6" />
+          <rect x="84" y="40" width="6" height="12" />
+          <rect x="96" y="46" width="18" height="6" />
+
+          <rect x="6" y="58" width="6" height="6" />
+          <rect x="18" y="58" width="12" height="12" />
+          <rect x="36" y="64" width="6" height="12" />
+          <rect x="48" y="52" width="12" height="12" />
+          <rect x="66" y="58" width="6" height="12" />
+          <rect x="78" y="64" width="12" height="6" />
+          <rect x="96" y="58" width="6" height="18" />
+          <rect x="108" y="64" width="8" height="6" />
+
+          <rect x="0" y="72" width="12" height="6" />
+          <rect x="24" y="72" width="6" height="6" />
+          <rect x="48" y="72" width="18" height="6" />
+          <rect x="72" y="76" width="12" height="12" />
+          <rect x="90" y="76" width="6" height="6" />
+          <rect x="104" y="82" width="12" height="6" />
+
+          <rect x="40" y="88" width="6" height="12" />
+          <rect x="52" y="84" width="12" height="6" />
+          <rect x="46" y="104" width="18" height="12" />
+          <rect x="70" y="96" width="6" height="18" />
+          <rect x="84" y="92" width="16" height="16" />
+          <rect x="90" y="98" width="4" height="4" fill="#FFFFFF" />
+          <rect x="106" y="96" width="10" height="6" />
+          <rect x="84" y="110" width="12" height="6" />
+          <rect x="102" y="108" width="14" height="8" />
+        </g>
+
+        <!-- Web App Details next to QR -->
+        <g transform="translate(164, 4)">
+          <rect x="0" y="0" width="96" height="22" rx="6" fill="#1E1B4B" stroke="#4338CA" stroke-width="1" />
+          <text x="48" y="15" text-anchor="middle" class="font-sans text-accent" font-size="10.5" font-weight="700">WEB REMOTE</text>
+
+          <text x="0" y="42" class="font-sans text-sub" font-size="12.5">iPhone / any browser: scan or open</text>
+
+          <!-- URL Pill -->
+          <rect x="0" y="52" width="248" height="36" rx="8" class="card-inner" />
+          <text x="12" y="75" class="font-mono text-accent" font-size="12.5" font-weight="700">http://172.20.10.4:8080/app</text>
+
+          <!-- Safari Instruction -->
+          <text x="0" y="108" class="font-sans text-muted" font-size="11.5">
+            <tspan x="0" dy="0">In Safari: <tspan class="text-sub">Share &gt; Add to Home Screen</tspan>.</tspan>
+            <tspan x="0" dy="16">Requires the access token below.</tspan>
+          </text>
+        </g>
+
+        <!-- Cycle Address Footer Button -->
+        <g transform="translate(0, 158)">
+          <rect width="412" height="30" rx="8" fill="#101123" stroke="#1E203B" stroke-width="1" />
+          <text x="206" y="19" text-anchor="middle" class="font-sans text-sub" font-size="11.5">
+            Adapter <tspan class="text-main" font-weight="600">1 / 1</tspan> — <tspan class="text-accent">Switch network interface ↻</tspan>
+          </text>
+        </g>
+      </g>
+    </g>
+
+    <!-- CARD 2: ACCESS TOKEN (SECURITY) -->
+    <g transform="translate(0, 404)" filter="url(#dropShadow)">
+      <rect width="460" height="156" rx="16" class="card" />
+
+      <g transform="translate(24, 24)">
+        <!-- Lock Icon -->
+        <rect x="2" y="7" width="14" height="11" rx="2" stroke="#818CF8" stroke-width="2" fill="none" />
+        <path d="M5 7V4.5C5 2.567 6.567 1 8.5 1H9.5C11.433 1 13 2.567 13 4.5V7" stroke="#818CF8" stroke-width="2" fill="none" />
+        
+        <text x="28" y="15" class="font-sans text-main" font-size="15" font-weight="700">Security &amp; Access Token</text>
+        <text x="0" y="38" class="font-sans text-sub" font-size="12">Shared secret required in <tspan class="font-mono text-main" font-size="11.5">X-Auth-Token</tspan> to authorize requests</text>
+
+        <!-- Input Field + Button Row -->
+        <g transform="translate(0, 54)">
+          <!-- Text Field -->
+          <rect x="0" y="0" width="286" height="46" rx="10" class="card-inner" stroke="#3730A3" stroke-width="1.2" />
+          <text x="14" y="15" class="font-sans text-muted" font-size="9.5" font-weight="700" letter-spacing="0.5">ACCESS TOKEN</text>
+          <text x="14" y="35" class="font-mono text-main" font-size="15" font-weight="700" letter-spacing="1.5">8888</text>
+          
+          <!-- Eye Icon (Show/Hide) -->
+          <g transform="translate(254, 15)" opacity="0.6">
+            <path d="M1 8C1 8 4 3 9 3C14 3 17 8 17 8C17 8 14 13 9 13C4 13 1 8 1 8Z" stroke="#94A3B8" stroke-width="1.5" fill="none" />
+            <circle cx="9" cy="8" r="2.5" stroke="#94A3B8" stroke-width="1.5" fill="none" />
+          </g>
+
+          <!-- Apply Token Button -->
+          <g transform="translate(298, 0)">
+            <rect width="114" height="46" rx="10" class="btn-primary" />
+            <text x="57" y="28" text-anchor="middle" class="font-sans text-main" font-size="13.5" font-weight="600">Apply token</text>
+          </g>
+        </g>
+      </g>
+    </g>
+  </g>
+
+  <!-- ========== RIGHT COLUMN: ACTIVITY LOG ========== -->
+  <g transform="translate(512, 168)" filter="url(#dropShadow)">
+    <rect width="576" height="560" rx="16" class="card" />
+
+    <!-- Log Header -->
+    <g transform="translate(24, 22)">
+      <!-- Terminal Icon -->
+      <path d="M3 5L9 10L3 15M11 15H17" stroke="#818CF8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none" />
+      <text x="28" y="15" class="font-sans text-main" font-size="15" font-weight="700">Activity Log</text>
+      
+      <!-- Event Count Badge -->
+      <rect x="122" y="0" width="68" height="22" rx="11" fill="#1E203B" />
+      <text x="156" y="15" text-anchor="middle" class="font-mono text-sub" font-size="11">1 event</text>
+
+      <!-- Clear Log Button -->
+      <g transform="translate(440, -4)">
+        <rect width="88" height="32" rx="8" class="btn-ghost" />
+        <text x="44" y="20" text-anchor="middle" class="font-sans text-sub" font-size="12" font-weight="600">Clear log</text>
+      </g>
+    </g>
+
+    <!-- Terminal Inner Surface -->
+    <g transform="translate(24, 64)">
+      <rect width="528" height="440" rx="12" class="card-inner" />
+
+      <!-- Terminal Top Bar (macOS/Modern console style subtle header) -->
+      <path d="M 12 0 H 516 A 12 12 0 0 1 528 12 V 32 H 0 V 12 A 12 12 0 0 1 12 0 Z" fill="#101123" />
+      <line x1="0" y1="32" x2="528" y2="32" stroke="#1E203B" stroke-width="1" />
+      <circle cx="16" cy="16" r="4" fill="#334155" />
+      <circle cx="30" cy="16" r="4" fill="#334155" />
+      <circle cx="44" cy="16" r="4" fill="#334155" />
+      <text x="264" y="20" text-anchor="middle" class="font-mono text-muted" font-size="11">server-events.log — auto-scroll</text>
+
+      <!-- Log Entries -->
+      <g transform="translate(18, 56)" class="font-mono" font-size="13">
+        <!-- Entry 1 (Actual screenshot entry) -->
+        <g transform="translate(0, 0)">
+          <rect x="-6" y="-15" width="504" height="28" rx="6" fill="rgba(16, 185, 129, 0.06)" />
+          <circle cx="6" cy="-1" r="3.5" fill="#10B981" />
+          <text x="18" y="4" class="text-muted">[14:40:29]</text>
+          <text x="106" y="4" class="text-emerald" font-weight="600">Server started on port 8080</text>
+        </g>
+
+        <!-- Subtle preview of how subsequent logs look in dark theme -->
+        <g transform="translate(0, 34)" opacity="0.45">
+          <circle cx="6" cy="-1" r="3" fill="#6366F1" />
+          <text x="18" y="4" class="text-muted">[14:40:30]</text>
+          <text x="106" y="4" class="text-sub">UDP discovery listener active on port 8888</text>
+        </g>
+
+        <!-- Active Cursor Line -->
+        <g transform="translate(0, 68)">
+          <text x="18" y="4" class="text-muted">&gt;</text>
+          <rect x="32" y="-9" width="7" height="15" fill="#6366F1" opacity="0.7" />
+        </g>
+      </g>
+
+      <!-- Custom Dark Scrollbar -->
+      <rect x="516" y="40" width="6" height="80" rx="3" fill="#252746" />
+    </g>
+
+    <!-- Bottom Status Footer inside Log Card -->
+    <g transform="translate(24, 520)">
+      <circle cx="8" cy="10" r="3.5" fill="#6366F1" />
+      <text x="20" y="14" class="font-sans text-muted" font-size="11.5">Listening for incoming HTTP commands and UDP discovery broadcasts...</text>
+      <text x="528" y="14" text-anchor="end" class="font-mono text-muted" font-size="11">MAX 500 LINES</text>
+    </g>
+  </g>
+</svg>
