@@ -16,6 +16,7 @@ sealed class Step {
     data class Close(val exe: String) : Step()                                // close discord.exe
     data class Power(val plan: String) : Step()                               // power high | balanced | saver
     data class Command(val id: String) : Step()                               // command mute  (a phone command button)
+    data class Replay(val file: String) : Step()                              // replay my-task.rec  (a recorded routine)
     object Valorant : Step()                                                  // valorant
 }
 
@@ -34,6 +35,7 @@ fun describeStep(step: Step): String = when (step) {
     is Step.Close -> "close " + step.exe
     is Step.Power -> "power " + step.plan
     is Step.Command -> "command " + step.id
+    is Step.Replay -> "replay " + step.file
     Step.Valorant -> "start Valorant"
 }
 
@@ -87,6 +89,7 @@ fun parseRoutines(
 
     val header = Regex("^\\[([a-z0-9_-]{1,30})]\\s*(.*)$")
     val exeName = Regex("^[A-Za-z0-9._-]+\\.exe$")
+    val recName = Regex("^[A-Za-z0-9_-]+\\.rec$")      // only a file name: a recording is always in ~/.onetouch/recordings
 
     text.lines().forEachIndexed { index, rawLine ->
         val lineNo = index + 1
@@ -126,6 +129,7 @@ fun parseRoutines(
             "close" -> rest.takeIf { exeName.matches(it) }?.let { Step.Close(it) }
             "power" -> rest.lowercase().takeIf { it in setOf("high", "balanced", "saver") }?.let { Step.Power(it) }
             "command" -> rest.takeIf { it in knownCommands }?.let { Step.Command(it) }
+            "replay" -> rest.takeIf { recName.matches(it) }?.let { Step.Replay(it) }
             else -> {
                 problems.add("Line $lineNo: unknown step \"$word\"")
                 return@forEachIndexed
@@ -138,6 +142,33 @@ fun parseRoutines(
     return ParsedRoutines(routines, problems)
 }
 
+// ---------- Deleting a routine ----------
+/**
+ * Removes the routine [id] from the text of routines.txt: its "[id] Name" line and all its steps.
+ * Notes (# lines) and empty lines that come after its last step are kept, because they usually belong
+ * to whatever follows. Returns null if there is no routine with this id in the text.
+ */
+fun removeRoutineText(text: String, id: String): String? {
+    val newline = if (text.contains("\r\n")) "\r\n" else "\n"
+    val lines = text.split(Regex("\r?\n")).toMutableList()
+    val header = Regex("^\\[([a-z0-9_-]{1,30})]")
+    fun headerId(line: String) = header.find(line.trim().removePrefix("\uFEFF"))?.groupValues?.get(1)
+    val start = lines.indexOfFirst { headerId(it) == id }
+    if (start < 0) return null
+    // the routine goes on until the next "[...]" line (the same rule the file reader uses)
+    var next = start + 1
+    while (next < lines.size && !lines[next].trim().startsWith("[")) next++
+    var lastStep = start
+    for (i in start + 1 until next) {
+        val l = lines[i].trim()
+        if (l.isNotEmpty() && !l.startsWith("#")) lastStep = i
+    }
+    repeat(lastStep - start + 1) { lines.removeAt(start) }
+    // do not leave two empty lines next to each other
+    if (start in 1 until lines.size && lines[start - 1].isBlank() && lines[start].isBlank()) lines.removeAt(start)
+    return lines.joinToString(newline)
+}
+
 // ---------- Running a routine ----------
 // The real PC actions are plugged in from Main.kt, so this part can be tested without touching the PC.
 interface RoutineActions {
@@ -147,6 +178,7 @@ interface RoutineActions {
     fun close(exe: String)
     fun power(plan: String)
     fun command(id: String)
+    fun replay(file: String)          // plays a recording; returns when it is finished
     fun valorant()
     fun log(message: String)
 }
@@ -165,6 +197,7 @@ suspend fun executeRoutine(routine: Routine, actions: RoutineActions) {
                 is Step.Close -> actions.close(step.exe)
                 is Step.Power -> actions.power(step.plan)
                 is Step.Command -> actions.command(step.id)
+                is Step.Replay -> actions.replay(step.file)
                 Step.Valorant -> actions.valorant()
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -216,6 +249,7 @@ val DEFAULT_ROUTINES = """# One Touch Controller - routines
 #   close discord.exe               close a program by its .exe name
 #   power high                      power plan: high, balanced or saver
 #   command mute                    do the same as a phone command button (mute, volume_up, ...)
+#   replay my-task.rec              repeat mouse and keyboard actions you recorded with "Record" in the PC window
 
 [valorant] Valorant ready
 power high
