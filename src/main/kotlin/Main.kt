@@ -82,8 +82,6 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import javax.imageio.ImageIO
 import kotlin.concurrent.thread
-import kotlin.time.Duration.Companion.milliseconds
-import kotlin.time.Duration.Companion.seconds
 
 // ================= SETTINGS =================
 const val PORT = 8080                  // HTTP port for commands (the app uses 8080)
@@ -101,7 +99,7 @@ fun loadToken() {
             val saved = tokenFile.readText().trim()
             if (saved.isNotEmpty()) serverToken = saved
         }
-    } catch (_: Exception) {
+    } catch (e: Exception) {
         // ignore: we simply keep the default token
     }
 }
@@ -183,7 +181,7 @@ fun pasteText(text: String) {
     val previous: String? = try {
         if (clipboard.isDataFlavorAvailable(DataFlavor.stringFlavor))
             clipboard.getData(DataFlavor.stringFlavor) as? String else null
-    } catch (_: Exception) { null }
+    } catch (e: Exception) { null }
 
     clipboard.setContents(StringSelection(text), null)
     robot.delay(80)
@@ -191,7 +189,7 @@ fun pasteText(text: String) {
     robot.delay(250)   // give the other program time to read the clipboard
 
     if (previous != null) {
-        try { clipboard.setContents(StringSelection(previous), null) } catch (_: Exception) { }
+        try { clipboard.setContents(StringSelection(previous), null) } catch (e: Exception) { }
     }
 }
 
@@ -216,7 +214,7 @@ fun liveKeyCode(c: Char): Int? = when (c) {
 
 fun capsLockOn(): Boolean = try {
     Toolkit.getDefaultToolkit().getLockingKeyState(KeyEvent.VK_CAPS_LOCK)
-} catch (_: Exception) { false }
+} catch (e: Exception) { false }
 
 fun pressLiveKey(c: Char, caps: Boolean) {
     val code = liveKeyCode(c) ?: return
@@ -267,6 +265,9 @@ suspend fun ApplicationCall.checkToken(): Boolean {
     if (Guard.tokensEqual(request.headers["X-Auth-Token"], serverToken)) {
         if (Guard.recordSuccess(id)) {
             appLog("Device connected: $id" + if (Guard.isViaTunnel(this)) " (via the internet)" else "")
+        }
+        if (Devices.seen(id, request.headers["User-Agent"], Guard.isViaTunnel(this))) {
+            Presenter.show(tr("%1 connected", tr(appFromUserAgent(request.headers["User-Agent"]))))
         }
         return true
     }
@@ -344,6 +345,8 @@ fun startRoutine(routine: Routine, from: String): String {
     if (!RoutineStore.running.add(routine.id)) return "Already running: ${routine.name}"
     runningRoutines = runningRoutines + routine.id
     appLog("Routine started ($from): ${routine.name}")
+    val fromPhone = from.startsWith("phone")
+    if (fromPhone) Presenter.show(tr("Routine: %1", routine.name))
     routineResults.remove(routine.id)
     routineScope.launch {
         var failed = 0
@@ -360,6 +363,7 @@ fun startRoutine(routine: Routine, from: String): String {
             routineResults[routine.id] = failed           // first the result, then "not running" (no gap for the phone)
             RoutineStore.running.remove(routine.id)
             runningRoutines = runningRoutines - routine.id
+            if (fromPhone) Presenter.show(tr("Routine finished: %1", routine.name))
         }
     }
     return "Started: ${routine.name}"
@@ -481,7 +485,7 @@ suspend fun streamScreen(session: WebSocketSession, settings: SocketCommand.View
         }
         val now = System.currentTimeMillis()
         if (inFlight.get() >= 2 || now - lastSent < 60) {  // at most about 15 pictures a second
-            delay(5.milliseconds)
+            delay(5)
             continue
         }
         val picture = try {
@@ -491,12 +495,12 @@ suspend fun streamScreen(session: WebSocketSession, settings: SocketCommand.View
             renderScreenPicture(shot, view, settings.width, cursor)
         } catch (e: Exception) {
             session.send(Frame.Text("screenerror ${e.message ?: "cannot capture the screen"}"))
-            delay(2.seconds)
+            delay(2000)
             continue
         }
         val fingerprint = pictureFingerprint(picture)
         if (fingerprint == lastFingerprint && now - lastSent < 2000) {   // nothing changed: send nothing, look again soon
-            delay(120.milliseconds)
+            delay(120)
             continue
         }
         lastFingerprint = fingerprint
@@ -562,7 +566,14 @@ fun Application.remoteModule() {
                 call.respondText("Failed: ${e.message}", status = HttpStatusCode.InternalServerError)
                 return@post
             }
+            Presenter.show(tr(commandNames[name] ?: name.orEmpty()))
             call.respondText(message)
+        }
+
+        // ---- PC status for the phones: battery, charging, CPU and memory ----
+        get("/status") {
+            if (!call.checkToken()) return@get
+            call.respondText(withContext(Dispatchers.IO) { readPcStatus() }.toJson(), ContentType.Application.Json)
         }
 
         // ---- Fast live connection for the touchpad (see SocketProtocol.kt) ----
@@ -578,8 +589,9 @@ fun Application.remoteModule() {
             var viewing = false
             var buttonHeld = false
             val inFlight = AtomicInteger(0)      // pictures sent that the phone has not confirmed yet
+            val id = Guard.clientId(call)
+            var listed = false
             try {
-                val id = Guard.clientId(call)
                 val wait = Guard.blockedSeconds(id)
                 if (wait > 0) {
                     send(Frame.Text("blocked $wait"))
@@ -588,7 +600,7 @@ fun Application.remoteModule() {
                 }
 
                 // the login message has to arrive within 5 seconds
-                val first = withTimeoutOrNull(5.seconds) { incoming.receiveCatching().getOrNull() }
+                val first = withTimeoutOrNull(5000) { incoming.receiveCatching().getOrNull() }
                 val given = (first as? Frame.Text)?.readText()?.takeIf { it.startsWith("auth ") }?.substring(5)
                 if (!Guard.tokensEqual(given, serverToken)) {
                     val nowBlocked = Guard.recordFailure(id)
@@ -600,10 +612,18 @@ fun Application.remoteModule() {
                 if (Guard.recordSuccess(id)) {
                     appLog("Device connected: $id" + if (Guard.isViaTunnel(call)) " (via the internet)" else "")
                 }
+                listed = true
+                if (Devices.liveOpened(id, call.request.headers["User-Agent"], Guard.isViaTunnel(call))) {
+                    Presenter.show(tr("%1 connected", tr(appFromUserAgent(call.request.headers["User-Agent"]))))
+                }
                 send(Frame.Text("ok"))
 
                 for (frame in incoming) {
                     if (frame !is Frame.Text) continue
+                    if (Guard.blockedSeconds(id) > 0) {          // disconnected in the PC window
+                        close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "disconnected"))
+                        break
+                    }
                     when (val command = parseSocketCommand(frame.readText())) {
                         is SocketCommand.Move -> {
                             val p = MouseInfo.getPointerInfo().location
@@ -613,6 +633,7 @@ fun Application.remoteModule() {
                             val button = if (command.right) InputEvent.BUTTON3_DOWN_MASK else InputEvent.BUTTON1_DOWN_MASK
                             robot.mousePress(button)
                             robot.mouseRelease(button)
+                            Presenter.show(if (command.right) tr("Right click") else tr("Click"))
                         }
                         is SocketCommand.Scroll -> robot.mouseWheel(command.amount)
                         is SocketCommand.Ping -> send(Frame.Text("q ${command.stamp}"))
@@ -626,6 +647,7 @@ fun Application.remoteModule() {
                                 robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)
                                 robot.delay(40)
                             }
+                            Presenter.show(tr("Double click"))
                         }
                         is SocketCommand.Button -> {
                             if (command.down) robot.mousePress(InputEvent.BUTTON1_DOWN_MASK)
@@ -634,10 +656,11 @@ fun Application.remoteModule() {
                         }
                         is SocketCommand.Ack -> inFlight.updateAndGet { maxOf(0, it - 1) }
                         // direct typing from the other device's keyboard (same powers as /keyboard/live and /keyboard/key)
-                        is SocketCommand.TypeText -> liveType(0, command.text)
+                        is SocketCommand.TypeText -> { liveType(0, command.text); Presenter.show(tr("Typing")) }
                         is SocketCommand.KeyPress -> {
                             val codes = command.combo.split("+").map { keyCodeFor(it) }
                             if (codes.none { it == null }) withContext(Dispatchers.IO) { pressCombo(codes.filterNotNull()) }
+                            Presenter.show(tr("Key: %1", command.combo))
                         }
                         is SocketCommand.View -> {
                             if (!Guard.allowScreenView) {
@@ -649,6 +672,7 @@ fun Application.remoteModule() {
                                     viewing = true
                                     ScreenState.started()
                                     appLog("Screen viewing started: $id" + if (Guard.isViaTunnel(call)) " (via the internet)" else "")
+                                    Presenter.show(tr("Viewing the PC screen"))
                                 }
                                 streamJob = launch(Dispatchers.IO) { streamScreen(session, command, inFlight) }
                             }
@@ -672,6 +696,7 @@ fun Application.remoteModule() {
                     appLog("Screen viewing stopped")
                 }
                 if (buttonHeld) robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)   // never leave the mouse button stuck down
+                if (listed) Devices.liveClosed(id)
                 liveConnections.decrementAndGet()
             }
         }
@@ -688,6 +713,7 @@ fun Application.remoteModule() {
             val from = if (Guard.isViaTunnel(call)) "from the phone, via the internet" else "from the phone"
             try {
                 if (on) GuardMode.turnOn(from) else GuardMode.turnOff(from)
+                Presenter.show(if (on) tr("Guard mode on") else tr("Guard mode off"))
                 call.respondText(if (on) "Guard mode on" else "Guard mode off")
             } catch (e: Exception) {
                 appLog("Guard mode could not start: ${e.message}")
@@ -769,6 +795,7 @@ fun Application.remoteModule() {
                 robot.mouseRelease(button)
                 if (which == "double") robot.delay(40)
             }
+            Presenter.show(when (which) { "right" -> tr("Right click"); "double" -> tr("Double click"); else -> tr("Click") })
             call.respondText("OK")
         }
 
@@ -796,6 +823,7 @@ fun Application.remoteModule() {
                 return@post
             }
             appLog("Typed ${text.length} characters")   // the text itself is not logged (could be a password)
+            Presenter.show(tr("Typed %1 characters", text.length))     // the text itself is not shown either
             call.respondText("Typed ${text.length} characters")
         }
 
@@ -812,6 +840,7 @@ fun Application.remoteModule() {
             }
             try {
                 liveType(backspaces, text)   // not logged: it happens on every key press and could be a password
+                Presenter.show(tr("Typing"))
             } catch (e: Exception) {
                 call.respondText("Failed: ${e.message}", status = HttpStatusCode.InternalServerError)
                 return@post
@@ -837,6 +866,7 @@ fun Application.remoteModule() {
                 return@post
             }
             appLog("Key: $combo")
+            Presenter.show(tr("Key: %1", combo))
             call.respondText("OK")
         }
     }
@@ -893,7 +923,7 @@ class ServerController {
                             appLog("Find PC request answered (${packet.address.hostAddress})")
                         }
                     }
-                } catch (_: Exception) {
+                } catch (e: Exception) {
                     // the socket was closed because the server was stopped: this is normal
                 }
             }
@@ -1014,7 +1044,16 @@ fun ServerApp(controller: ServerController) {
     var dialogMessage by remember { mutableStateOf<String?>(null) }
     var showSettings by remember { mutableStateOf(false) }
     var guardPassword by remember { mutableStateOf("") }
-    var tab by remember { mutableStateOf(0) }                       // 0 Home, 1 Internet, 2 Routines, 3 Security, 4 Log
+    var tab by remember { mutableStateOf(0) }
+    // "12 s ago" in the devices list: the time is refreshed every 5 seconds
+    var clock by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(5000)
+            clock = System.currentTimeMillis()
+            Devices.publish(clock)
+        }
+    }                       // 0 Home, 1 Internet, 2 Routines, 3 Security, 4 Log
     var confirmRoutine by remember { mutableStateOf<Routine?>(null) }   // "run this risky routine?" question
     var deleteAsk by remember { mutableStateOf<Routine?>(null) }        // "delete this routine?" question
 
@@ -1031,7 +1070,7 @@ fun ServerApp(controller: ServerController) {
     // Refresh the address list every 5 seconds (it changes when you switch Wi-Fi or turn on the hotspot)
     LaunchedEffect(Unit) {
         while (true) {
-            delay(5.seconds)
+            delay(5000)
             addresses = withContext(Dispatchers.IO) { localAddresses() }
         }
     }
@@ -1207,6 +1246,67 @@ fun ServerApp(controller: ServerController) {
                         Text(tr("Apply token"))
                     }
                 }
+
+                // ----- presentation mode -----
+                Surface(shape = OtcCardShape, color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier.padding(14.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(tr("Presentation mode"), style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                tr("Shows every action from a phone in the bottom-right corner of this screen, so an audience can follow along."),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = OtcMuted
+                            )
+                        }
+                        Switch(checked = Presenter.enabled, onCheckedChange = {
+                            Presenter.enabled = it
+                            appLog(if (it) "Presentation mode on" else "Presentation mode off")
+                        })
+                    }
+                }
+
+                // ----- connected devices -----
+                Surface(shape = OtcCardShape, color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(tr("Connected devices") + " (" + Devices.list.size + ")", style = MaterialTheme.typography.titleSmall)
+                        if (Devices.list.isEmpty()) {
+                            Text(tr("No phone has connected yet."), style = MaterialTheme.typography.bodyMedium, color = OtcMuted)
+                        }
+                        Devices.list.forEach { d ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(OtcInk, OtcKeyShape)
+                                    .padding(start = 14.dp, end = 8.dp, top = 8.dp, bottom = 8.dp)
+                            ) {
+                                Box(modifier = Modifier.size(10.dp).background(if (d.live || clock - d.lastSeen < 30_000) OtcAccent else OtcMuted, CircleShape))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(tr(d.app), style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        d.id + "   ·   " + (if (d.viaInternet) tr("Internet") else tr("Same network")) + "   ·   " + agoText(clock - d.lastSeen),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = OtcMuted
+                                    )
+                                }
+                                OutlinedButton(shape = OtcKeyShape, onClick = {
+                                    Devices.disconnect(d.id)
+                                    appLog("Disconnected ${d.id} (refused for 10 minutes)")
+                                }) { Text(tr("Disconnect")) }
+                            }
+                        }
+                        Text(
+                            tr("A disconnected device is refused for 10 minutes. To keep it out for good, change the token."),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = OtcMuted
+                        )
+                    }
+                }
             }
             1 ->             Column(
                 modifier = Modifier
@@ -1346,7 +1446,7 @@ fun ServerApp(controller: ServerController) {
                             OutlinedButton(shape = OtcKeyShape, onClick = {
                                 try {
                                     ProcessBuilder("notepad.exe", RoutineStore.file.absolutePath).start()
-                                } catch (_: Exception) {
+                                } catch (e: Exception) {
                                     dialogMessage = tr("Could not open Notepad. The file is here:\n%1", RoutineStore.file.absolutePath)
                                 }
                             }) { Text(tr("Edit file")) }
@@ -1431,7 +1531,7 @@ fun ServerApp(controller: ServerController) {
                                         return@Button
                                     }
                                     scope.launch {
-                                        for (n in 3 downTo 1) { recordCountdown = n; delay(1.seconds) }
+                                        for (n in 3 downTo 1) { recordCountdown = n; delay(1000) }
                                         recordCountdown = 0
                                         try {
                                             recordCount = 0

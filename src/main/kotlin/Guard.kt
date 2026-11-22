@@ -105,6 +105,13 @@ object Guard {
         return before == null || now - before > 30 * 60 * 1000L
     }
 
+    // Refuses a device for a while (the "Disconnect" button in the PC window)
+    fun blockFor(id: String, ms: Long) {
+        val a = attempts.getOrPut(id) { Attempts() }
+        synchronized(a) { a.blockedUntil = System.currentTimeMillis() + ms }
+        lastSeen.remove(id)
+    }
+
     // A long random token (no look-alike characters such as 0/O or 1/l/I)
     fun generateToken(length: Int = 24): String {
         val chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"

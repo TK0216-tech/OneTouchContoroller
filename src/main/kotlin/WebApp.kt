@@ -3,7 +3,11 @@
 //
 // NOTE for editing: this page is inside a Kotlin raw string, so never write a dollar sign in it.
 
-val WEB_APP_HTML = """<!DOCTYPE html>
+// The page is kept in several pieces: one piece of text in a Java class file may be at most 64 KB,
+// and the whole page (with its Japanese and Chinese words) is bigger than that. They are joined once, at start.
+val WEB_APP_HTML: String by lazy { listOf(WEB_APP_PART_1, WEB_APP_PART_2, WEB_APP_PART_3).joinToString("") }
+
+private val WEB_APP_PART_1 = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -145,6 +149,12 @@ val WEB_APP_HTML = """<!DOCTYPE html>
   .hint { font-size: 12.5px; color: var(--muted); line-height: 1.5; }
   /* Guard mode button: filled with the accent colour while Guard mode is on */
   #guardBtn.on { background: var(--accent); color: var(--accent-ink); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .35), 0 3px 0 var(--accent-deep); }
+  /* PC status chip in the header (battery / CPU) */
+  #pcStat { font-size: 12.5px; font-weight: 600; color: var(--muted); background: var(--panel); border: 1px solid var(--line);
+            border-radius: 999px; padding: 4px 10px; white-space: nowrap; }
+  #pcStat.low { color: var(--danger); border-color: var(--danger); }
+  h1 { white-space: nowrap; }
+  @media (max-width: 430px) { h1 { font-size: 16.5px; gap: 8px; } #pcStat { padding: 3px 8px; font-size: 12px; } }
   /* settings */
   #setBtn { width: 40px; min-height: 40px; padding: 0; background: none; box-shadow: none; color: var(--muted); display: flex; align-items: center; justify-content: center; }
   #setBtn svg { width: 22px; height: 22px; }
@@ -177,7 +187,7 @@ val WEB_APP_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <h1><span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v8"/><path d="M6.3 7.2a8 8 0 1 0 11.4 0"/></svg></span>One Touch Controller<span class="grow"></span><button id="setBtn" aria-label="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg></button><span id="dot" title="Connection to the PC"></span></h1>
+  <h1><span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v8"/><path d="M6.3 7.2a8 8 0 1 0 11.4 0"/></svg></span>One Touch Controller<span class="grow"></span><span id="pcStat" hidden></span><button id="setBtn" aria-label="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg></button><span id="dot" title="Connection to the PC"></span></h1>
 
   <div class="row">
     <input id="token" type="password" placeholder="Access token" autocomplete="off">
@@ -390,7 +400,9 @@ var otcWords = {
     "Guard mode works on Windows only": ["ガードモードはWindowsでのみ使えます", "守护模式只能在 Windows 上使用"],
     "Guard mode could not start": ["ガードモードを開始できませんでした", "无法启动守护模式"],
     "Guard mode on. Wrong passwords typed at the PC: ": ["ガードモードはオンです。PCで入力された間違ったパスワード: ", "守护模式已开启。在电脑上输错密码的次数: "],
-    "Turn on Guard mode? The PC's own mouse and keyboard stop working until someone types the Guard password at the PC or you turn it off here.": ["ガードモードをオンにしますか？PCでガードパスワードが入力されるか、ここでオフにするまで、PC本体のマウスとキーボードは使えなくなります。", "开启守护模式吗？在电脑上输入守护密码或在这里关闭之前，电脑本身的鼠标和键盘将无法使用。"],
+"""
+
+private val WEB_APP_PART_2 = """    "Turn on Guard mode? The PC's own mouse and keyboard stop working until someone types the Guard password at the PC or you turn it off here.": ["ガードモードをオンにしますか？PCでガードパスワードが入力されるか、ここでオフにするまで、PC本体のマウスとキーボードは使えなくなります。", "开启守护模式吗？在电脑上输入守护密码或在这里关闭之前，电脑本身的鼠标和键盘将无法使用。"],
     "Lock with Windows? Your phone cannot see or control the PC until someone signs in at the PC.": ["Windowsでロックしますか？PCでサインインするまで、スマホから画面を見ることも操作することもできなくなります。", "用 Windows 锁定吗？在电脑上登录之前，手机将无法查看或控制电脑。"],
     "Guard mode": ["ガードモード", "守护模式"],
     "Windows locked the PC, so Guard mode turned itself off.": ["Windowsがロックされたため、ガードモードは自動でオフになりました。", "Windows 已锁定电脑，守护模式已自动关闭。"],
@@ -405,7 +417,11 @@ var otcWords = {
     "I will be right back.": ["すぐに戻ります。", "我马上回来。"],
     "Please wait for the owner.": ["持ち主が戻るまでお待ちください。", "请等待主人回来。"],
     "Message shown on the PC": ["PCにメッセージを表示しました", "已在电脑上显示消息"],
-    "The message is empty": ["メッセージが空です", "消息为空"]
+    "The message is empty": ["メッセージが空です", "消息为空"],
+    "Battery": ["バッテリー", "电池"],
+    "(charging)": ["（充電中）", "（充电中）"],
+    "Memory": ["メモリ", "内存"],
+    "The PC battery is low: ": ["PCのバッテリーが少なくなっています: ", "电脑电量低: "]
   };
 function t(s) {
   if (otcLang === 'en') return s;
@@ -532,6 +548,7 @@ function otcTranslatePage() {
     by('token').blur();
     setStatus(token ? t('Token saved on this phone') : t('Token is empty'));
     refreshGuard();
+    refreshStatus();
   };
   if (!token) setStatus(t('Type the access token from the PC window, then press Save.'));
 
@@ -694,6 +711,33 @@ function otcTranslatePage() {
   }
   refreshGuard();
   setInterval(function () { if (!document.hidden) refreshGuard(); }, 15000);
+
+  // ---------- PC status (battery, CPU, memory) in the header ----------
+  var lowWarned = false;
+  function refreshStatus() {
+    if (!token) return;
+    fetch('/status', { headers: { 'X-Auth-Token': token }, cache: 'no-store' })
+      .then(function (r) { return r.status === 200 ? r.json() : null; })
+      .then(function (st) {
+        var chip = by('pcStat');
+        if (!st) { chip.hidden = true; return; }
+        var parts = [];
+        if (st.battery >= 0) parts.push(t('Battery') + ' ' + st.battery + '%' + (st.charging ? ' ' + t('(charging)') : ''));
+        if (st.cpu >= 0) parts.push('CPU ' + st.cpu + '%');
+        if (st.memory >= 0) parts.push(t('Memory') + ' ' + st.memory + '%');
+        chip.title = 'PC: ' + parts.join(' / ');
+        chip.textContent = st.battery >= 0 ? ((st.charging ? '\u26A1 ' : '\uD83D\uDD0B ') + st.battery + '%') : ('CPU ' + st.cpu + '%');
+        var low = st.battery >= 0 && st.battery <= 20 && !st.charging;
+        chip.classList.toggle('low', low);
+        chip.hidden = false;
+        if (low && !lowWarned) { lowWarned = true; setStatus(t('The PC battery is low: ') + st.battery + '%'); }
+        if (!low) lowWarned = false;
+      })
+      .catch(function () { });
+  }
+  by('pcStat').onclick = function () { setStatus(by('pcStat').title); };
+  refreshStatus();
+  setInterval(function () { if (!document.hidden) refreshStatus(); }, 30000);
 
   // ---------- Message to PC ----------
   [t('This PC is in use. Please do not touch it.'), t('I will be right back.'), t('Please wait for the owner.')].forEach(function (text) {
@@ -1023,7 +1067,9 @@ function otcTranslatePage() {
     lastTouchAt = Date.now();
     if (e.touches.length > 1) { cancelGesture(); return; }
     var t = e.touches[0];
-    g = { x: t.clientX, y: t.clientY, t0: Date.now(), moved: false, long: false, down: false };
+"""
+
+private val WEB_APP_PART_3 = """    g = { x: t.clientX, y: t.clientY, t0: Date.now(), moved: false, long: false, down: false };
     clearTimeout(gLong);
     gLong = setTimeout(function () {                  // finger held still = right click
       if (g && !g.moved) {

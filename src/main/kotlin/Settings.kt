@@ -56,7 +56,7 @@ object Look {
             dark = p.getProperty("dark", "true") != "false"
             accent = (p.getProperty("accent", "0").toIntOrNull() ?: 0).coerceIn(accents.indices)
             lang = p.getProperty("lang", lang).takeIf { it in setOf("en", "ja", "zh") } ?: lang
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             // a broken settings file is not a reason to stop: the defaults are used
         }
     }
@@ -69,7 +69,7 @@ object Look {
             p.setProperty("accent", accent.toString())
             p.setProperty("lang", lang)
             file.outputStream().use { p.store(it, "One Touch Controller - window settings") }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             // not saved: the choice still works until the program is closed
         }
     }
@@ -308,5 +308,55 @@ private val words: Map<String, Array<String>> = mapOf(
     "Message from the owner's phone" to arrayOf("持ち主のスマホからのメッセージ", "来自主人手机的消息"),
     "Click to close" to arrayOf("クリックで閉じる", "点击关闭"),
     "Recording: %1 actions so far. Press F9 or Stop when the task is finished." to arrayOf("記録中：現在 %1 件の操作。作業が終わったら F9 か「停止」を押してください。", "正在录制：已有 %1 个操作。任务完成后请按 F9 或“停止”。"),
-    "Stop" to arrayOf("停止", "停止")
+    "Stop" to arrayOf("停止", "停止"),
+    "Open Notepad" to arrayOf("メモ帳を開く", "打开记事本"),
+    "Open Calculator" to arrayOf("電卓を開く", "打开计算器"),
+    "Open File Explorer" to arrayOf("エクスプローラーを開く", "打开文件资源管理器"),
+    "Open Chrome" to arrayOf("Chromeを開く", "打开 Chrome"),
+    "Open YouTube" to arrayOf("YouTubeを開く", "打开 YouTube"),
+    "Open Google" to arrayOf("Googleを開く", "打开 Google"),
+    "Run script 1" to arrayOf("スクリプト1を実行", "运行脚本 1"),
+    "Volume up" to arrayOf("音量アップ", "音量增大"),
+    "Volume down" to arrayOf("音量ダウン", "音量减小"),
+    "Mute" to arrayOf("ミュート", "静音"),
+    "Play / Pause" to arrayOf("再生 / 一時停止", "播放 / 暂停"),
+    "Next track" to arrayOf("次の曲", "下一首"),
+    "Previous track" to arrayOf("前の曲", "上一首"),
+    "Lock with Windows" to arrayOf("Windowsでロック", "用 Windows 锁定"),
+    "Screenshot" to arrayOf("スクリーンショット", "截图"),
+    "Shut down in 60 s" to arrayOf("60秒後にシャットダウン", "60 秒后关机"),
+    "Restart in 60 s" to arrayOf("60秒後に再起動", "60 秒后重启"),
+    "Cancel shutdown" to arrayOf("シャットダウンを取り消す", "取消关机"),
+    "From the phone" to arrayOf("スマホから", "来自手机"),
+    "%1 connected" to arrayOf("%1 が接続しました", "%1 已连接"),
+    "Android app" to arrayOf("Androidアプリ", "Android 应用"),
+    "Android app (Gesture Operate)" to arrayOf("Androidアプリ（Gesture Operate）", "Android 应用（Gesture Operate）"),
+    "Web (iPhone)" to arrayOf("Web（iPhone）", "网页（iPhone）"),
+    "Web (iPad)" to arrayOf("Web（iPad）", "网页（iPad）"),
+    "Web (Android)" to arrayOf("Web（Android）", "网页（Android）"),
+    "Web (Windows)" to arrayOf("Web（Windows）", "网页（Windows）"),
+    "Web (Mac)" to arrayOf("Web（Mac）", "网页（Mac）"),
+    "Web browser" to arrayOf("Webブラウザー", "网页浏览器"),
+    "Unknown app" to arrayOf("不明なアプリ", "未知应用"),
+    "Routine: %1" to arrayOf("ルーティン: %1", "例程: %1"),
+    "Routine finished: %1" to arrayOf("ルーティン完了: %1", "例程完成: %1"),
+    "Click" to arrayOf("クリック", "单击"),
+    "Right click" to arrayOf("右クリック", "右键单击"),
+    "Double click" to arrayOf("ダブルクリック", "双击"),
+    "Typing" to arrayOf("文字を入力中", "正在输入"),
+    "Typed %1 characters" to arrayOf("%1 文字を入力しました", "已输入 %1 个字符"),
+    "Key: %1" to arrayOf("キー: %1", "按键: %1"),
+    "Viewing the PC screen" to arrayOf("PCの画面を表示中", "正在查看电脑屏幕"),
+    "Guard mode on" to arrayOf("ガードモードをオンにしました", "守护模式已开启"),
+    "Guard mode off" to arrayOf("ガードモードをオフにしました", "守护模式已关闭"),
+    "Presentation mode" to arrayOf("プレゼンモード", "演示模式"),
+    "Shows every action from a phone in the bottom-right corner of this screen, so an audience can follow along." to arrayOf("スマホからの操作をこの画面の右下に表示します。発表のときに、見ている人が操作を追いやすくなります。", "在此屏幕右下角显示来自手机的每个操作，方便观众跟上。"),
+    "Connected devices" to arrayOf("接続中のデバイス", "已连接的设备"),
+    "No phone has connected yet." to arrayOf("まだスマホは接続していません。", "还没有手机连接。"),
+    "Same network" to arrayOf("同じネットワーク", "同一网络"),
+    "Disconnect" to arrayOf("切断", "断开"),
+    "A disconnected device is refused for 10 minutes. To keep it out for good, change the token." to arrayOf("切断したデバイスは10分間接続できません。完全に締め出すにはトークンを変更してください。", "断开的设备 10 分钟内无法连接。要永久阻止，请更改令牌。"),
+    "now" to arrayOf("たった今", "刚刚"),
+    "%1 s ago" to arrayOf("%1 秒前", "%1 秒前"),
+    "%1 min ago" to arrayOf("%1 分前", "%1 分钟前")
 )

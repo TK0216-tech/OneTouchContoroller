@@ -1,9 +1,9 @@
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 
 plugins {
-    kotlin("jvm") version "2.4.21"
-    id("org.jetbrains.kotlin.plugin.compose") version "2.4.21"   // must be the same version as Kotlin
-    id("org.jetbrains.compose") version "1.12.2"
+    kotlin("jvm") version "2.2.20"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.2.20"   // must be the same version as Kotlin
+    id("org.jetbrains.compose") version "1.9.3"
 }
 
 repositories {
@@ -40,7 +40,7 @@ compose.desktop {
             vendor = "THANT SIN OO"
 
             // Java parts that the packaged program needs (Netty/Ktor use these)
-            modules("java.instrument", "java.management", "java.naming", "java.net.http", "java.sql", "java.logging", "jdk.unsupported")
+            modules("java.instrument", "java.management", "java.naming", "java.net.http", "java.sql", "java.logging", "jdk.management", "jdk.unsupported")
 
             windows {
                 iconFile.set(project.file("icon.ico"))   // icon.ico must be in the project folder
