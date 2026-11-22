@@ -102,7 +102,7 @@ object InputRecorder : NativeKeyListener, NativeMouseInputListener, NativeMouseW
     private fun scale(): Double = try {
         GraphicsEnvironment.getLocalGraphicsEnvironment().defaultScreenDevice.defaultConfiguration.defaultTransform.scaleX
             .takeIf { it > 0.0 } ?: 1.0
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         1.0
     }
 

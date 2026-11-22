@@ -209,7 +209,7 @@ object GuardMode {
 
     // ---------- settings file ----------
     private fun readFile(): Properties = Properties().also { p ->
-        try { if (file.isFile) file.inputStream().use { p.load(it) } } catch (e: Exception) { }
+        try { if (file.isFile) file.inputStream().use { p.load(it) } } catch (_: Exception) { }
     }
 
     private fun writeFile(p: Properties) {
@@ -223,7 +223,7 @@ object GuardMode {
         try {
             salt = p.getProperty("salt")?.let { Base64.getDecoder().decode(it) }
             hash = p.getProperty("hash")?.let { Base64.getDecoder().decode(it) }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             salt = null; hash = null
         }
         hasPassword = salt != null && hash != null
@@ -231,7 +231,7 @@ object GuardMode {
             Thread { restorePowerButtons() }.start()
         }
         // if the program is closed while guarding, the power buttons are put back
-        Runtime.getRuntime().addShutdownHook(Thread { if (active) try { restorePowerButtons() } catch (e: Exception) { } })
+        Runtime.getRuntime().addShutdownHook(Thread { if (active) try { restorePowerButtons() } catch (_: Exception) { } })
     }
 
     /** Saves a new Guard password. Returns an error message, or null if it was saved. */
@@ -278,12 +278,12 @@ object GuardMode {
         if (!active) return
         blocking = false
         stopHooks()
-        try { onUiThread { hideOverlay() } } catch (e: Exception) { }
+        try { onUiThread { hideOverlay() } } catch (_: Exception) { }
         active = false
         typed = ""
         ownerMessage = ""
         appLog("Guard mode OFF ($who)")
-        Thread { try { restorePowerButtons() } catch (e: Exception) { } }.start()
+        Thread { try { restorePowerButtons() } catch (_: Exception) { } }.start()
     }
 
     // ---------- messages from the phone ----------
@@ -368,7 +368,7 @@ object GuardMode {
 
     // Fonts that look right on Windows for each language (the first one that is installed is used)
     private val installedFonts: Set<String> by lazy {
-        try { GraphicsEnvironment.getLocalGraphicsEnvironment().availableFontFamilyNames.toSet() } catch (e: Exception) { emptySet() }
+        try { GraphicsEnvironment.getLocalGraphicsEnvironment().availableFontFamilyNames.toSet() } catch (_: Exception) { emptySet() }
     }
     private fun family(light: Boolean = false): String {
         val wanted = when (Look.lang) {
@@ -478,7 +478,7 @@ object GuardMode {
                     windowsTookOver("Windows locked the PC")
                     return@Thread
                 }
-                try { Thread.sleep(2000) } catch (e: InterruptedException) { return@Thread }
+                try { Thread.sleep(2000) } catch (_: InterruptedException) { return@Thread }
             }
         }, "guard-lock-watch").apply { isDaemon = true }.start()
     }
@@ -498,7 +498,7 @@ object GuardMode {
             wts.WTSFreeMemory(buffer.value)
             if (level == 1 && (flags == 0 || flags == 1)) flags else null
         }
-    } catch (e: Throwable) {
+    } catch (_: Throwable) {
         null
     }
 
@@ -575,7 +575,7 @@ object GuardMode {
             }
 
             // A hidden window that answers "no" when Windows asks "may I shut down?"
-            val shutdownWindow = try { createShutdownBlocker(module) } catch (e: Exception) { null }
+            val shutdownWindow = try { createShutdownBlocker(module) } catch (_: Exception) { null }
             // keep the PC (and the screen) awake while guarding
             kernel32.SetThreadExecutionState(ES_CONTINUOUS or ES_SYSTEM_REQUIRED or ES_DISPLAY_REQUIRED)
             started.countDown()
@@ -591,8 +591,8 @@ object GuardMode {
             user32.UnhookWindowsHookEx(mouseHook)
             keyboardHook = null; mouseHook = null
             if (shutdownWindow != null) {
-                try { Wtsapi32.INSTANCE.WTSUnRegisterSessionNotification(shutdownWindow) } catch (e: Throwable) { }
-                try { User32Extra.INSTANCE.ShutdownBlockReasonDestroy(shutdownWindow) } catch (e: Throwable) { }
+                try { Wtsapi32.INSTANCE.WTSUnRegisterSessionNotification(shutdownWindow) } catch (_: Throwable) { }
+                try { User32Extra.INSTANCE.ShutdownBlockReasonDestroy(shutdownWindow) } catch (_: Throwable) { }
                 user32.DestroyWindow(shutdownWindow)
             }
             kernel32.SetThreadExecutionState(ES_CONTINUOUS)
@@ -639,11 +639,11 @@ object GuardMode {
             ?: return null
         try {
             User32Extra.INSTANCE.ShutdownBlockReasonCreate(hwnd, WString("This PC is in Guard mode (One Touch Controller)."))
-        } catch (e: Throwable) {
+        } catch (_: Throwable) {
             // older Windows: the window still refuses, only without a reason text
         }
         // tell this window when Windows locks the PC
-        val told = try { Wtsapi32.INSTANCE.WTSRegisterSessionNotification(hwnd, Wtsapi32.NOTIFY_FOR_THIS_SESSION) } catch (e: Throwable) { false }
+        val told = try { Wtsapi32.INSTANCE.WTSRegisterSessionNotification(hwnd, Wtsapi32.NOTIFY_FOR_THIS_SESSION) } catch (_: Throwable) { false }
         if (!told) appLog("  Guard mode cannot see when Windows locks the PC: if it locks, turn Guard mode off from your phone")
         return hwnd
     }
@@ -661,14 +661,14 @@ object GuardMode {
                 val b = device.defaultConfiguration.bounds
                 b to blurred(robot.createScreenCapture(b))
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             emptyList()
         }
         window.contentPane = LockPicture(backdrops)
         window.bounds = GraphicsEnvironment.getLocalGraphicsEnvironment().screenDevices
             .map { it.defaultConfiguration.bounds }
             .reduce { a, b -> a.union(b) }                   // all monitors
-        try { window.opacity = 0.99f } catch (e: Exception) { }   // makes it a "layered" window (needed for click-through)
+        try { window.opacity = 0.99f } catch (_: Exception) { }   // makes it a "layered" window (needed for click-through)
         window.isVisible = true
 
         val hwnd = HWND(Native.getComponentPointer(window))
@@ -677,7 +677,7 @@ object GuardMode {
         // click-through: clicks from the phone go to the programs underneath
         user32.SetWindowLong(hwnd, GWL_EXSTYLE, ex or WS_EX_LAYERED or WS_EX_TRANSPARENT or WS_EX_TOOLWINDOW or WS_EX_NOACTIVATE or WS_EX_TOPMOST)
         // hidden from screen capture: the phone sees the desktop, not the lock picture
-        val hidden = try { User32Extra.INSTANCE.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } catch (e: Throwable) { false }
+        val hidden = try { User32Extra.INSTANCE.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } catch (_: Throwable) { false }
         if (!hidden) appLog("  This Windows version cannot hide the lock screen from capture: the phone's Screen tab shows the lock picture")
 
         fun keepOnTop() {
@@ -760,7 +760,7 @@ object GuardMode {
         override fun paintComponent(g0: Graphics) {
             val g = g0 as Graphics2D
             smooth(g)
-            val origin = try { locationOnScreen.let { it.x to it.y } } catch (e: Exception) { 0 to 0 }
+            val origin = try { locationOnScreen.let { it.x to it.y } } catch (_: Exception) { 0 to 0 }
 
             // background: the blurred desktop (or plain navy if the picture could not be taken)
             g.color = INK

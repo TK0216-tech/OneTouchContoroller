@@ -1,9 +1,9 @@
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 
 plugins {
-    kotlin("jvm") version "2.2.20"
-    id("org.jetbrains.kotlin.plugin.compose") version "2.2.20"   // must be the same version as Kotlin
-    id("org.jetbrains.compose") version "1.9.3"
+    kotlin("jvm") version "2.4.21"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.4.21"   // must be the same version as Kotlin
+    id("org.jetbrains.compose") version "1.12.2"
 }
 
 repositories {

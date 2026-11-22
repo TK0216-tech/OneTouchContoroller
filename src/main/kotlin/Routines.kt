@@ -6,6 +6,7 @@
 
 import kotlinx.coroutines.delay
 import java.io.File
+import kotlin.time.Duration.Companion.seconds
 
 // ---------- The steps ----------
 sealed class Step {
@@ -192,7 +193,7 @@ suspend fun executeRoutine(routine: Routine, actions: RoutineActions) {
             when (step) {
                 is Step.Launch -> actions.launch(step.program, step.args)
                 is Step.Open -> actions.open(step.target)
-                is Step.Wait -> delay(step.seconds * 1000L)
+                is Step.Wait -> delay(step.seconds.seconds)
                 is Step.Key -> actions.key(step.combo)
                 is Step.Close -> actions.close(step.exe)
                 is Step.Power -> actions.power(step.plan)
@@ -227,7 +228,7 @@ fun findRiotClient(
                 if (File(path).isFile) return path
             }
         }
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         // fall through to the default folder
     }
     return if (defaultExe.isFile) defaultExe.absolutePath else null

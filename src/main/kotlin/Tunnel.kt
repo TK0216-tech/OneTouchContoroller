@@ -51,7 +51,7 @@ class TunnelController {
             val line = p.inputStream.bufferedReader().readLines().firstOrNull { it.isNotBlank() }?.trim()
             p.waitFor()
             if (p.exitValue() == 0 && line != null && File(line).isFile) File(line) else null
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             null
         }
     }
@@ -139,7 +139,7 @@ class TunnelController {
                     }
                     if (line.contains(" ERR ")) lastError = line.substringAfter(" ERR ").trim().take(160)
                 }
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 // the process was stopped: normal
             }
             p.waitFor()

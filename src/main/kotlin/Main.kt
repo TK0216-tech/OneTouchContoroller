@@ -82,6 +82,8 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import javax.imageio.ImageIO
 import kotlin.concurrent.thread
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 // ================= SETTINGS =================
 const val PORT = 8080                  // HTTP port for commands (the app uses 8080)
@@ -99,7 +101,7 @@ fun loadToken() {
             val saved = tokenFile.readText().trim()
             if (saved.isNotEmpty()) serverToken = saved
         }
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         // ignore: we simply keep the default token
     }
 }
@@ -181,7 +183,7 @@ fun pasteText(text: String) {
     val previous: String? = try {
         if (clipboard.isDataFlavorAvailable(DataFlavor.stringFlavor))
             clipboard.getData(DataFlavor.stringFlavor) as? String else null
-    } catch (e: Exception) { null }
+    } catch (_: Exception) { null }
 
     clipboard.setContents(StringSelection(text), null)
     robot.delay(80)
@@ -189,7 +191,7 @@ fun pasteText(text: String) {
     robot.delay(250)   // give the other program time to read the clipboard
 
     if (previous != null) {
-        try { clipboard.setContents(StringSelection(previous), null) } catch (e: Exception) { }
+        try { clipboard.setContents(StringSelection(previous), null) } catch (_: Exception) { }
     }
 }
 
@@ -214,7 +216,7 @@ fun liveKeyCode(c: Char): Int? = when (c) {
 
 fun capsLockOn(): Boolean = try {
     Toolkit.getDefaultToolkit().getLockingKeyState(KeyEvent.VK_CAPS_LOCK)
-} catch (e: Exception) { false }
+} catch (_: Exception) { false }
 
 fun pressLiveKey(c: Char, caps: Boolean) {
     val code = liveKeyCode(c) ?: return
@@ -479,7 +481,7 @@ suspend fun streamScreen(session: WebSocketSession, settings: SocketCommand.View
         }
         val now = System.currentTimeMillis()
         if (inFlight.get() >= 2 || now - lastSent < 60) {  // at most about 15 pictures a second
-            delay(5)
+            delay(5.milliseconds)
             continue
         }
         val picture = try {
@@ -489,12 +491,12 @@ suspend fun streamScreen(session: WebSocketSession, settings: SocketCommand.View
             renderScreenPicture(shot, view, settings.width, cursor)
         } catch (e: Exception) {
             session.send(Frame.Text("screenerror ${e.message ?: "cannot capture the screen"}"))
-            delay(2000)
+            delay(2.seconds)
             continue
         }
         val fingerprint = pictureFingerprint(picture)
         if (fingerprint == lastFingerprint && now - lastSent < 2000) {   // nothing changed: send nothing, look again soon
-            delay(120)
+            delay(120.milliseconds)
             continue
         }
         lastFingerprint = fingerprint
@@ -586,7 +588,7 @@ fun Application.remoteModule() {
                 }
 
                 // the login message has to arrive within 5 seconds
-                val first = withTimeoutOrNull(5000) { incoming.receiveCatching().getOrNull() }
+                val first = withTimeoutOrNull(5.seconds) { incoming.receiveCatching().getOrNull() }
                 val given = (first as? Frame.Text)?.readText()?.takeIf { it.startsWith("auth ") }?.substring(5)
                 if (!Guard.tokensEqual(given, serverToken)) {
                     val nowBlocked = Guard.recordFailure(id)
@@ -891,7 +893,7 @@ class ServerController {
                             appLog("Find PC request answered (${packet.address.hostAddress})")
                         }
                     }
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     // the socket was closed because the server was stopped: this is normal
                 }
             }
@@ -1029,7 +1031,7 @@ fun ServerApp(controller: ServerController) {
     // Refresh the address list every 5 seconds (it changes when you switch Wi-Fi or turn on the hotspot)
     LaunchedEffect(Unit) {
         while (true) {
-            delay(5000)
+            delay(5.seconds)
             addresses = withContext(Dispatchers.IO) { localAddresses() }
         }
     }
@@ -1344,7 +1346,7 @@ fun ServerApp(controller: ServerController) {
                             OutlinedButton(shape = OtcKeyShape, onClick = {
                                 try {
                                     ProcessBuilder("notepad.exe", RoutineStore.file.absolutePath).start()
-                                } catch (e: Exception) {
+                                } catch (_: Exception) {
                                     dialogMessage = tr("Could not open Notepad. The file is here:\n%1", RoutineStore.file.absolutePath)
                                 }
                             }) { Text(tr("Edit file")) }
@@ -1429,7 +1431,7 @@ fun ServerApp(controller: ServerController) {
                                         return@Button
                                     }
                                     scope.launch {
-                                        for (n in 3 downTo 1) { recordCountdown = n; delay(1000) }
+                                        for (n in 3 downTo 1) { recordCountdown = n; delay(1.seconds) }
                                         recordCountdown = 0
                                         try {
                                             recordCount = 0

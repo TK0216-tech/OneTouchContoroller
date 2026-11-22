@@ -202,14 +202,14 @@ fun replayRecording(
                     "kd" -> windowsKeyToJava(e.a)?.let { target.keyPress(it); keysDown.add(it) }
                     "ku" -> windowsKeyToJava(e.a)?.let { if (keysDown.remove(it)) target.keyRelease(it) }
                 }
-            } catch (ex: IllegalArgumentException) {
+            } catch (_: IllegalArgumentException) {
                 // a key this keyboard layout does not have: skip it and go on
             }
         }
         return true
     } finally {
-        for (button in buttonsDown) try { target.mouseRelease(button) } catch (ex: Exception) { }
-        for (key in keysDown) try { target.keyRelease(key) } catch (ex: Exception) { }
+        for (button in buttonsDown) try { target.mouseRelease(button) } catch (_: Exception) { }
+        for (key in keysDown) try { target.keyRelease(key) } catch (_: Exception) { }
     }
 }
 

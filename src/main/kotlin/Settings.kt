@@ -56,7 +56,7 @@ object Look {
             dark = p.getProperty("dark", "true") != "false"
             accent = (p.getProperty("accent", "0").toIntOrNull() ?: 0).coerceIn(accents.indices)
             lang = p.getProperty("lang", lang).takeIf { it in setOf("en", "ja", "zh") } ?: lang
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             // a broken settings file is not a reason to stop: the defaults are used
         }
     }
@@ -69,7 +69,7 @@ object Look {
             p.setProperty("accent", accent.toString())
             p.setProperty("lang", lang)
             file.outputStream().use { p.store(it, "One Touch Controller - window settings") }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             // not saved: the choice still works until the program is closed
         }
     }
